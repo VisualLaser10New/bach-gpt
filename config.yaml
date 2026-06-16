@@ -41,6 +41,7 @@ training:
   save_steps: 500                   # Save checkpoint every N steps
   logging_steps: 50                 # Log every N steps
   seed: 42
+  transposition_keys: [-1, 0, 1]    # Semitone offsets for data augmentation (3x instead of 12x)
 
 # Inference Configuration
 generate:

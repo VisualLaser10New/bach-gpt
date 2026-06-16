@@ -40,9 +40,9 @@ def download_builtin_bach_corpus(target_dir):
             
     print(f"Successfully extracted {success_count} Bach files to {target_dir}")
 
-def transpose_midi(midi_path, output_dir):
+def transpose_midi(midi_path, output_dir, semitones_list=[-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]):
     """
-    Transpose a MIDI file into all 12 keys (from -6 to +5 semitones)
+    Transpose a MIDI file into specified keys
     and save them to output_dir using symusic (extremely fast C++ parser).
     Also assigns a unique program number to each track to preserve voice identity.
     """
@@ -55,8 +55,8 @@ def transpose_midi(midi_path, output_dir):
             
         base_name = os.path.splitext(os.path.basename(midi_path))[0]
         
-        # Transpose from -6 to +5 semitones (12 keys total)
-        for semitones in range(-6, 6):
+        # Transpose to requested semitones
+        for semitones in semitones_list:
             suffix = f"_transposed_{semitones}" if semitones != 0 else ""
             out_name = f"{base_name}{suffix}.mid"
             out_path = os.path.join(output_dir, out_name)
@@ -73,14 +73,14 @@ def transpose_midi(midi_path, output_dir):
 
 # Module-level helper for ProcessPoolExecutor pickling
 def _transpose_worker(args):
-    midi_path, output_dir = args
-    transpose_midi(midi_path, output_dir)
+    midi_path, output_dir, semitones_list = args
+    transpose_midi(midi_path, output_dir, semitones_list)
 
-def prepare_dataset(raw_dir, processed_dir):
+def prepare_dataset(raw_dir, processed_dir, semitones_list=[-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]):
     """
     Main preprocessing pipeline:
     1. Checks if raw_dir is empty. If so, downloads/extracts default Bach files.
-    2. Transposes all files in raw_dir into processed_dir in parallel (12x augmentation).
+    2. Transposes all files in raw_dir into processed_dir in parallel.
     """
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
@@ -93,7 +93,7 @@ def prepare_dataset(raw_dir, processed_dir):
         download_builtin_bach_corpus(default_dir)
         midi_files = get_midi_files(default_dir)
         
-    print(f"Starting data preparation. Processing {len(midi_files)} files with 12x augmentation...")
+    print(f"Starting data preparation. Processing {len(midi_files)} files with {len(semitones_list)}x augmentation...")
     
     # Clear processed_dir first to avoid duplicates
     if os.path.exists(processed_dir):
@@ -104,7 +104,7 @@ def prepare_dataset(raw_dir, processed_dir):
     num_workers = min(os.cpu_count() or 4, 12)
     print(f"Spawning {num_workers} parallel processes for data transposition...")
     
-    tasks = [(f, processed_dir) for f in midi_files]
+    tasks = [(f, processed_dir, semitones_list) for f in midi_files]
     
     try:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -112,12 +112,12 @@ def prepare_dataset(raw_dir, processed_dir):
             list(tqdm(
                 executor.map(_transpose_worker, tasks),
                 total=len(tasks),
-                desc="Augmenting dataset (transposing to 12 keys)"
+                desc="Augmenting dataset (transposing to requested keys)"
             ))
     except Exception as e:
         print(f"Parallel augmentation failed: {e}. Falling back to sequential execution...")
         for f in tqdm(midi_files, desc="Augmenting dataset (sequential fallback)"):
-            transpose_midi(f, processed_dir)
+            transpose_midi(f, processed_dir, semitones_list)
         
     augmented_files = get_midi_files(processed_dir)
     print(f"Data preparation complete. Total files in processed directory: {len(augmented_files)}")

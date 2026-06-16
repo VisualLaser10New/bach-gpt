@@ -97,7 +97,8 @@ def main():
             
     # Phase 1: Data Preparation & Augmentation
     print("--- Phase 1: Preparing and Augmenting Dataset ---")
-    prepare_dataset(DATASET_DIR, PROCESSED_DIR)
+    semitones_list = train_config.get("transposition_keys", [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5])
+    prepare_dataset(DATASET_DIR, PROCESSED_DIR, semitones_list=semitones_list)
     processed_files = get_midi_files(PROCESSED_DIR)
     
     if len(processed_files) == 0:
