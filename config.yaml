@@ -45,5 +45,6 @@ training:
 # Inference Configuration
 generate:
   max_length: 512                   # Max tokens to generate
-  temperature: 0.95                 # Creativity (higher = more random)
+  temperature: 0.87                 # Creativity (lower = more structured/coherent)
   top_p: 0.9                        # Nucleus sampling threshold
+  top_k: 15                         # Filter out low-probability tokens

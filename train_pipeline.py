@@ -82,18 +82,44 @@ def main():
         val_split=0.2 if not args.dry_run else 0.0 # No val split for tiny dry-run
     )
     
-    # Phase 4: Model Instantiation
-    print("\n--- Phase 4: Initializing Transformer Model ---")
-    model = get_model(tokenizer, model_config)
+    # Phase 4: Model Instantiation / Resume Check
+    print("\n--- Phase 4: Initializing/Resuming Transformer Model ---")
+    
+    start_epoch = 1
+    latest_epoch_path = None
+    
+    if os.path.exists(checkpoint_dir) and not args.dry_run:
+        import re
+        epoch_dirs = []
+        for name in os.listdir(checkpoint_dir):
+            match = re.match(r"^epoch_(\d+)$", name)
+            if match:
+                epoch_num = int(match.group(1))
+                epoch_dirs.append((epoch_num, os.path.join(checkpoint_dir, name)))
+        
+        if epoch_dirs:
+            # Sort by epoch number to get the latest
+            epoch_dirs.sort(key=lambda x: x[0])
+            latest_epoch, latest_epoch_path = epoch_dirs[-1]
+            start_epoch = latest_epoch + 1
+            
+    if latest_epoch_path:
+        print(f"Found existing checkpoint. Resuming training from {latest_epoch_path} (Starting at Epoch {start_epoch})...")
+        from transformers import GPT2LMHeadModel
+        model = GPT2LMHeadModel.from_pretrained(latest_epoch_path)
+    else:
+        print("No existing checkpoints found. Initializing new model weights...")
+        model = get_model(tokenizer, model_config)
     
     # Phase 5: Model Training
-    print("\n--- Phase 5: Training Model on CPU ---")
+    print("\n--- Phase 5: Training Model ---")
     train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         train_config=train_config,
-        checkpoint_dir=checkpoint_dir
+        checkpoint_dir=checkpoint_dir,
+        start_epoch=start_epoch
     )
     
     # Phase 6: Output Generation

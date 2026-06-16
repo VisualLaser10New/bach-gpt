@@ -3,7 +3,7 @@ import torch
 from torch.optim import AdamW
 from tqdm import tqdm
 
-def train_model(model, train_loader, val_loader, train_config, checkpoint_dir):
+def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, start_epoch=1):
     """
     Standard PyTorch training loop with CUDA GPU support.
     Automatically detects and runs on CUDA GPU if available.
@@ -24,7 +24,7 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir):
     
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader) if val_loader else 0}")
     
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch, num_epochs + 1):
         # --- TRAINING PHASE ---
         model.train()
         total_train_loss = 0
