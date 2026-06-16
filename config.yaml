@@ -1,0 +1,49 @@
+# Paths (relative to project root directory)
+paths:
+  dataset_dir: "dataset"
+  processed_dir: "processed"
+  checkpoint_dir: "checkpoints"
+  tokenizer_path: "tokenizer.json"
+  output_dir: "output"
+
+# Tokenizer Configuration (REMI)
+tokenizer:
+  pitch_range: [21, 109]            # Piano pitch range (A0 to C8)
+  beat_res:
+    "0,4": 4                        # 4 steps per beat (sixteenth notes)
+  num_velocities: 8                 # Quantize velocity into 8 bins (dynamics)
+  use_chords: true                  # Recognize chords
+  use_rests: true                   # Represent rests explicitly
+  rest_range: [0.25, 8.0]           # Minimum rest size is 1/4 beat, max is 8 beats
+  beat_res_rest:
+    "0,4": 4                        # Rest resolution (must match beat_res)
+  use_tempos: true                  # Represent tempo changes
+  use_time_signatures: false        # Keep time signatures simple (4/4 assumed)
+  use_programs: true                # Identify different channels/instruments (tracks)
+
+# Model Configuration (Upscaled GPT-2 for GPU training)
+model:
+  vocab_size: null                  # Will be set dynamically based on tokenizer
+  n_positions: 512                  # Context window (sequence length)
+  n_embd: 384                       # Embedding dimension (upscaled from 256)
+  n_layer: 6                        # Number of Transformer layers (upscaled from 4)
+  n_head: 12                        # Number of attention heads (upscaled from 8)
+  bos_token_id: null                # Will be set from tokenizer
+  eos_token_id: null                # Will be set from tokenizer
+  pad_token_id: null                # Will be set from tokenizer
+
+# Training Configuration (Optimized for GPU)
+training:
+  batch_size: 32                    # Batch size (increased to 32 for GPU memory/cores efficiency)
+  learning_rate: 0.0005             # Learning rate
+  num_epochs: 20                    # Number of epochs (increased to 20 for better convergence)
+  weight_decay: 0.01                # Regularization
+  save_steps: 500                   # Save checkpoint every N steps
+  logging_steps: 50                 # Log every N steps
+  seed: 42
+
+# Inference Configuration
+generate:
+  max_length: 512                   # Max tokens to generate
+  temperature: 0.95                 # Creativity (higher = more random)
+  top_p: 0.9                        # Nucleus sampling threshold

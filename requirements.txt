@@ -1,0 +1,6 @@
+torch
+music21
+miditok
+transformers
+tqdm
+symusic
