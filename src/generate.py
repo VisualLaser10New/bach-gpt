@@ -1,6 +1,6 @@
 import os
 import torch
-from transformers import GPT2LMHeadModel, LogitsProcessor, LogitsProcessorList
+from transformers import GPT2LMHeadModel
 from miditok import TokSequence
 import music21
 
@@ -86,21 +86,6 @@ INSTRUMENT_TO_PROGRAM = {
     "shana": 111,
 }
 
-class RestrictInstrumentsLogitsProcessor(LogitsProcessor):
-    """
-    Modifies logits during generation to prevent the model from composing 
-    for any instrument (program) not selected by the user, including 
-    BPE-merged tokens containing those programs.
-    """
-    def __init__(self, blocked_token_ids):
-        self.blocked_token_ids = set(blocked_token_ids)
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        # Penalize blocked program tokens by setting their logit to -infinity
-        for token_id in self.blocked_token_ids:
-            scores[:, token_id] = -float("inf")
-        return scores
-
 def get_program_number(name):
     """Maps a string instrument name to a General MIDI program number."""
     name_clean = name.strip().lower()
@@ -172,43 +157,6 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         prompt_tokens.append(bos_token_id)
     else:
         prompt_tokens.append(0)
-        
-    # Setup logits processor to block forbidden instruments during generation
-    logits_processor = LogitsProcessorList()
-    
-    if program_ids:
-        print(f"Enforcing instrument constraints via logits processor for programs: {program_ids}")
-        allowed_program_tokens = []
-        for prog in program_ids:
-            token_name = f"Program_{prog}"
-            if token_name in tokenizer:
-                allowed_program_tokens.append(tokenizer[token_name])
-            else:
-                print(f"Warning: Token '{token_name}' not in tokenizer vocabulary. Skipping.")
-                
-        # Find all program tokens in vocabulary
-        all_program_tokens = [v for k, v in tokenizer.vocab.items() if k.startswith("Program_")]
-        blocked_programs = set(all_program_tokens) - set(allowed_program_tokens)
-        
-        # Pre-analyze vocabulary to block BPE merged tokens containing blocked programs
-        blocked_token_ids = set()
-        
-        for token_id in range(len(tokenizer)):
-            # Create sequence and decode BPE to check its base component tokens
-            seq = TokSequence(ids=[token_id])
-            seq.are_ids_encoded = True
-            tokenizer.decode_token_ids(seq)
-            
-            # If any component base ID is in blocked_programs, block the entire token ID
-            if any(base_id in blocked_programs for base_id in seq.ids):
-                blocked_token_ids.add(token_id)
-                
-        print(f"Blocked {len(blocked_token_ids)} tokens (including BPE merges) containing forbidden programs.")
-        
-        # Append the restriction logits processor
-        logits_processor.append(
-            RestrictInstrumentsLogitsProcessor(blocked_token_ids)
-        )
                 
     input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
         
@@ -224,28 +172,58 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
             temperature=generate_config["temperature"],
             top_p=generate_config["top_p"],
             top_k=generate_config.get("top_k", 30),
+            repetition_penalty=generate_config.get("repetition_penalty", 1.15),
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
-            logits_processor=logits_processor,
         )
         
     # Extract token list and move back to CPU for decoding
     generated_tokens = generation_output[0].cpu().tolist()
     print(f"Generated raw sequence of {len(generated_tokens)} tokens.")
     
+    # Decompose BPE tokens into base tokens before checking for bar boundaries
+    seq = TokSequence(ids=generated_tokens)
+    seq.are_ids_encoded = True
+    tokenizer.decode_token_ids(seq)
+    
     # Truncate at the last completed Bar token to prevent incomplete measures and hanging notes
     bar_token_id = tokenizer["Bar_None"] if "Bar_None" in tokenizer else None
-    if bar_token_id is not None and bar_token_id in generated_tokens:
-        # Find index of last Bar token
-        last_bar_idx = len(generated_tokens) - 1 - generated_tokens[::-1].index(bar_token_id)
+    if bar_token_id is not None and bar_token_id in seq.ids:
+        # Find index of last Bar token in base tokens
+        last_bar_idx = len(seq.ids) - 1 - seq.ids[::-1].index(bar_token_id)
         # Keep tokens up to and including the bar boundary
-        generated_tokens = generated_tokens[:last_bar_idx + 1]
-        print(f"Cleaned end of sequence. Truncated at last bar boundary. New length: {len(generated_tokens)} tokens.")
+        seq.ids = seq.ids[:last_bar_idx + 1]
+        print(f"Cleaned end of sequence. Truncated at last bar boundary. New length: {len(seq.ids)} base tokens.")
     
     # Decode tokens back into a MIDI/Score object
     print("Decoding tokens back to MIDI...")
     try:
-        decoded_midi = tokenizer(generated_tokens)
+        decoded_midi = tokenizer(seq)
+        
+        # Enforce a single stable tempo (clear chaotic tempo changes from under-trained model)
+        if hasattr(decoded_midi, "tempos"):
+            initial_qpm = 120.0
+            if len(decoded_midi.tempos) > 0:
+                initial_qpm = decoded_midi.tempos[0].qpm
+            
+            decoded_midi.tempos.clear()
+            import symusic
+            decoded_midi.tempos.append(symusic.Tempo(0, initial_qpm))
+            print(f"Cleaned tempo changes. Enforced a stable constant tempo of {initial_qpm:.2f} BPM.")
+            
+        # Re-map tracks to requested instruments in order (avoiding out-of-distribution logits issues)
+        if program_ids and hasattr(decoded_midi, "tracks"):
+            print(f"Applying custom instrument re-mapping for tracks: {program_ids}")
+            for i, track in enumerate(decoded_midi.tracks):
+                if i < len(program_ids):
+                    old_prog = track.program
+                    new_prog = program_ids[i]
+                    track.program = new_prog
+                    
+                    # Set a descriptive track name based on program number
+                    names = [k for k, v in INSTRUMENT_TO_PROGRAM.items() if v == new_prog]
+                    track.name = names[0].title() if names else f"Voice {i+1}"
+                    print(f"  Track {i}: Remapped Program {old_prog} -> Program {new_prog} ({track.name})")
         
         # Save MIDI file
         os.makedirs(os.path.dirname(output_midi_path), exist_ok=True)

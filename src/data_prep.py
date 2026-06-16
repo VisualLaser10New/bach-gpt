@@ -44,9 +44,15 @@ def transpose_midi(midi_path, output_dir):
     """
     Transpose a MIDI file into all 12 keys (from -6 to +5 semitones)
     and save them to output_dir using symusic (extremely fast C++ parser).
+    Also assigns a unique program number to each track to preserve voice identity.
     """
     try:
         score = symusic.Score(midi_path)
+        
+        # Assign unique program numbers to each track to preserve voice identity during tokenization
+        for idx, track in enumerate(score.tracks):
+            track.program = idx
+            
         base_name = os.path.splitext(os.path.basename(midi_path))[0]
         
         # Transpose from -6 to +5 semitones (12 keys total)

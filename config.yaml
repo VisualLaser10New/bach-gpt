@@ -24,7 +24,7 @@ tokenizer:
 # Model Configuration (Upscaled GPT-2 for GPU training)
 model:
   vocab_size: null                  # Will be set dynamically based on tokenizer
-  n_positions: 512                  # Context window (sequence length)
+  n_positions: 1024                 # Context window (sequence length) (Updated from 512)
   n_embd: 384                       # Embedding dimension (upscaled from 256)
   n_layer: 6                        # Number of Transformer layers (upscaled from 4)
   n_head: 12                        # Number of attention heads (upscaled from 8)
@@ -44,7 +44,8 @@ training:
 
 # Inference Configuration
 generate:
-  max_length: 512                   # Max tokens to generate
+  max_length: 1024                  # Max tokens to generate (Updated from 512)
   temperature: 0.87                 # Creativity (lower = more structured/coherent)
   top_p: 0.9                        # Nucleus sampling threshold
   top_k: 15                         # Filter out low-probability tokens
+  repetition_penalty: 1.0           # No repetition penalty (prevents timeline progression blockage)

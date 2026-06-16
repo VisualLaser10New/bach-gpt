@@ -19,6 +19,11 @@ def main():
         action="store_true", 
         help="Run a quick end-to-end dry-run with a tiny model and dataset to verify code correctness."
     )
+    parser.add_argument(
+        "--no-train",
+        action="store_true",
+        help="Only prepare dataset, build tokenizer, and initialize/save model, but do not run training."
+    )
     args = parser.parse_args()
     
     # Define model and training configs (which can be overridden in dry-run)
@@ -50,41 +55,7 @@ def main():
             "max_length": 64,
         })
         
-    # Phase 1: Data Preparation & Augmentation
-    print("--- Phase 1: Preparing and Augmenting Dataset ---")
-    prepare_dataset(DATASET_DIR, PROCESSED_DIR)
-    processed_files = get_midi_files(PROCESSED_DIR)
-    
-    if len(processed_files) == 0:
-        print("Error: No augmented MIDI files found in processed/ directory.")
-        sys.exit(1)
-        
-    if args.dry_run:
-        # Keep only a tiny fraction of files for dry-run
-        processed_files = processed_files[:6]
-        print(f"Dry-run: truncated dataset to {len(processed_files)} files.")
-        
-    # Phase 2: Tokenizer Loading & BPE Training
-    print("\n--- Phase 2: Loading & Training Tokenizer ---")
-    # Train BPE vocabulary on raw unaugmented files.
-    # Transposing to 12 keys doesn't change rhythm or structural patterns, so training on 
-    # augmented files is 12x redundant and slows tokenizer training down unnecessarily.
-    tokenizer_files = get_midi_files(DATASET_DIR) if not args.dry_run else processed_files
-    tokenizer = get_tokenizer(tokenizer_files, force_rebuild=args.dry_run)
-    
-    # Phase 3: DataLoader Preparation
-    print("\n--- Phase 3: Preparing PyTorch DataLoaders ---")
-    train_loader, val_loader = prepare_dataset_loaders(
-        files_paths=processed_files,
-        tokenizer=tokenizer,
-        max_seq_len=model_config["n_positions"],
-        batch_size=train_config["batch_size"],
-        val_split=0.2 if not args.dry_run else 0.0 # No val split for tiny dry-run
-    )
-    
-    # Phase 4: Model Instantiation / Resume Check
-    print("\n--- Phase 4: Initializing/Resuming Transformer Model ---")
-    
+    # Detect checkpoint epoch early to know if we are starting a fresh run
     start_epoch = 1
     latest_epoch_path = None
     
@@ -103,6 +74,46 @@ def main():
             latest_epoch, latest_epoch_path = epoch_dirs[-1]
             start_epoch = latest_epoch + 1
             
+    # Phase 1: Data Preparation & Augmentation
+    print("--- Phase 1: Preparing and Augmenting Dataset ---")
+    prepare_dataset(DATASET_DIR, PROCESSED_DIR)
+    processed_files = get_midi_files(PROCESSED_DIR)
+    
+    if len(processed_files) == 0:
+        print("Error: No augmented MIDI files found in processed/ directory.")
+        sys.exit(1)
+        
+    if args.dry_run:
+        # Keep only a tiny fraction of files for dry-run
+        processed_files = processed_files[:6]
+        print(f"Dry-run: truncated dataset to {len(processed_files)} files.")
+        
+    # Phase 2: Tokenizer Loading & BPE Training
+    print("\n--- Phase 2: Loading & Training Tokenizer ---")
+    # Train BPE vocabulary on raw unaugmented files with program mapping applied.
+    # To do this, we select processed files that do not contain "_transposed_" in their filenames.
+    tokenizer_files = [f for f in processed_files if "_transposed_" not in os.path.basename(f)]
+    if args.dry_run:
+        tokenizer_files = tokenizer_files[:6]
+        
+    # Force rebuild the tokenizer if we are starting a fresh run (epoch 1) to ensure the mapping matches
+    force_rebuild = (start_epoch == 1) or args.dry_run
+    if force_rebuild:
+        print("Starting a fresh run. Rebuilding tokenizer from scratch on mapped files...")
+    tokenizer = get_tokenizer(tokenizer_files, force_rebuild=force_rebuild)
+    
+    # Phase 3: DataLoader Preparation
+    print("\n--- Phase 3: Preparing PyTorch DataLoaders ---")
+    train_loader, val_loader = prepare_dataset_loaders(
+        files_paths=processed_files,
+        tokenizer=tokenizer,
+        max_seq_len=model_config["n_positions"],
+        batch_size=train_config["batch_size"],
+        val_split=0.2 if not args.dry_run else 0.0 # No val split for tiny dry-run
+    )
+    
+    # Phase 4: Model Instantiation / Resume Check
+    print("\n--- Phase 4: Initializing/Resuming Transformer Model ---")
     if latest_epoch_path:
         print(f"Found existing checkpoint. Resuming training from {latest_epoch_path} (Starting at Epoch {start_epoch})...")
         from transformers import GPT2LMHeadModel
@@ -110,31 +121,43 @@ def main():
     else:
         print("No existing checkpoints found. Initializing new model weights...")
         model = get_model(tokenizer, model_config)
+        
+    # Save the initialized model configuration/weights so inference script can load it
+    best_model_path = os.path.join(checkpoint_dir, "best_model")
+    if start_epoch == 1:
+        os.makedirs(best_model_path, exist_ok=True)
+        model.save_pretrained(best_model_path)
+        print(f"Saved baseline model configuration to {best_model_path}")
     
     # Phase 5: Model Training
-    print("\n--- Phase 5: Training Model ---")
-    train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        train_config=train_config,
-        checkpoint_dir=checkpoint_dir,
-        start_epoch=start_epoch
-    )
+    if args.no_train:
+        print("\n--- Phase 5: Model Training (SKIPPED via --no-train flag) ---")
+    else:
+        print("\n--- Phase 5: Training Model ---")
+        train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            train_config=train_config,
+            checkpoint_dir=checkpoint_dir,
+            start_epoch=start_epoch
+        )
     
     # Phase 6: Output Generation
     print("\n--- Phase 6: Generating Sample Sheet Music ---")
-    best_model_path = os.path.join(checkpoint_dir, "best_model")
     out_mid = os.path.join(OUTPUT_DIR, "dry_run_bach.mid" if args.dry_run else "generated_bach.mid")
     out_xml = os.path.join(OUTPUT_DIR, "dry_run_bach.xml" if args.dry_run else "generated_bach.xml")
     
-    generate_music(
-        model_path=best_model_path,
-        tokenizer=tokenizer,
-        generate_config=generate_config,
-        output_midi_path=out_mid,
-        output_xml_path=out_xml
-    )
+    if os.path.exists(best_model_path):
+        generate_music(
+            model_path=best_model_path,
+            tokenizer=tokenizer,
+            generate_config=generate_config,
+            output_midi_path=out_mid,
+            output_xml_path=out_xml
+        )
+    else:
+        print("Skipping generation: no model found at best_model.")
     
     print("\n==========================================================")
     print("             Pipeline Executed Successfully!             ")
