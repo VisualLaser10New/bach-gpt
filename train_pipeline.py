@@ -24,6 +24,11 @@ def main():
         action="store_true",
         help="Only prepare dataset, build tokenizer, and initialize/save model, but do not run training."
     )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Delete all existing checkpoints and tokenizer to start a clean run from epoch 1."
+    )
     args = parser.parse_args()
     
     # Define model and training configs (which can be overridden in dry-run)
@@ -32,6 +37,22 @@ def main():
     generate_config = GENERATE_CONFIG.copy()
     checkpoint_dir = CHECKPOINT_DIR
     
+    if args.reset:
+        print("Reset flag active. Cleaning up existing checkpoints and tokenizer...")
+        import shutil
+        # Clean checkpoint directory
+        if os.path.exists(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        # Clean tokenizer
+        tokenizer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer.json")
+        if os.path.exists(tokenizer_path):
+            try:
+                os.remove(tokenizer_path)
+                print("Deleted existing tokenizer.json")
+            except OSError as e:
+                print(f"Warning: Could not delete tokenizer.json: {e}")
+                
     print("==========================================================")
     print("   J.S. Bach Polyphonic Sheet Music AI Training Pipeline  ")
     print("==========================================================\n")
