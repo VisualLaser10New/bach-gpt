@@ -251,6 +251,29 @@ def parse_key_string(key_str):
     else:
         return music21.key.Key(tonic.upper())
 
+def group_keyboard_staves(score):
+    """Groups consecutive parts sharing the same name with a curly brace (StaffGroup)."""
+    parts = list(score.parts)
+    groups = []
+    i = 0
+    while i < len(parts):
+        part_name = parts[i].partName
+        group = [parts[i]]
+        j = i + 1
+        while j < len(parts) and parts[j].partName == part_name:
+            group.append(parts[j])
+            j += 1
+        if len(group) > 1:
+            groups.append((part_name, group))
+            i = j
+        else:
+            i += 1
+            
+    for name, group_parts in groups:
+        print(f"  Grouping {len(group_parts)} staves under '{name}' with a brace...")
+        sg = music21.layout.StaffGroup(group_parts, name=name, symbol="brace")
+        score.insert(0, sg)
+
 def transpose_to_target_key(midi_path, xml_path, target_key_str):
     """Detects the key of the generated score and transposes it to the target key."""
     if not target_key_str:
@@ -271,6 +294,7 @@ def transpose_to_target_key(midi_path, xml_path, target_key_str):
         if semitones != 0:
             print(f"  Transposing score by {semitones} semitones ({detected_key.tonic.name} -> {target_key.tonic.name})...")
             # 1. Transpose MusicXML using music21
+            group_keyboard_staves(score)
             transposed_score = score.transpose(interval)
             transposed_score.write('musicxml', fp=xml_path)
             
@@ -400,6 +424,27 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
             else:
                 slots.append({"name": inst_name, "program": prog, "hand": "solo"})
                 
+        # Group staves for keyboard instruments so music21 can merge them into a single part with 2 staves
+        keyboard_counts = {}
+        for slot in slots:
+            if slot["hand"] != "solo":
+                keyboard_counts[slot["name"]] = keyboard_counts.get(slot["name"], 0) + 1
+                
+        keyboard_indices = {}
+        for slot in slots:
+            if slot["hand"] != "solo":
+                total_keyboard_slots = keyboard_counts[slot["name"]]
+                if total_keyboard_slots > 2:
+                    # Multiple keyboards of this type: number them, e.g. "Harpsichord 1"
+                    if slot["hand"] == "right":
+                        keyboard_indices[slot["name"]] = keyboard_indices.get(slot["name"], 0) + 1
+                    slot["track_name"] = f"{slot['name'].title()} {keyboard_indices[slot['name']]}"
+                else:
+                    # Single keyboard of this type: name it simply the instrument name (e.g. "Harpsichord")
+                    slot["track_name"] = slot["name"].title()
+            else:
+                slot["track_name"] = slot["name"].title()
+                
         num_tracks = len(decoded_midi.tracks)
         num_slots = len(slots)
         print(f"Applying custom instrument re-mapping. Distributing {num_tracks} tracks into {num_slots} slots...")
@@ -412,7 +457,7 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
                 slot = slots[idx]
                 track = decoded_midi.tracks[idx]
                 track.program = slot["program"]
-                track.name = f"{slot['name'].title()} ({slot['hand'].upper()})" if slot["hand"] != "solo" else slot["name"].title()
+                track.name = slot["track_name"]
                 
                 min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
                 fit_track_to_range(track, min_p, max_p)
@@ -426,7 +471,7 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
                 
                 merged_track = symusic.Track(
                     program=slot["program"],
-                    name=f"{slot['name'].title()} ({slot['hand'].upper()})" if slot["hand"] != "solo" else slot["name"].title()
+                    name=slot["track_name"]
                 )
                 for t_idx in group_indices:
                     orig_track = decoded_midi.tracks[t_idx]
@@ -455,6 +500,7 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
     print("Converting MIDI output to MusicXML sheet music format...")
     try:
         score = music21.converter.parse(output_midi_path)
+        group_keyboard_staves(score)
         score.write('musicxml', fp=output_xml_path)
         print(f"Saved sheet music to {output_xml_path}")
     except Exception as e:
