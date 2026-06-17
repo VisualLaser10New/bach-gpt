@@ -270,9 +270,16 @@ def transpose_to_target_key(midi_path, xml_path, target_key_str):
         
         if semitones != 0:
             print(f"  Transposing score by {semitones} semitones ({detected_key.tonic.name} -> {target_key.tonic.name})...")
+            # 1. Transpose MusicXML using music21
             transposed_score = score.transpose(interval)
-            transposed_score.write('midi', fp=midi_path)
             transposed_score.write('musicxml', fp=xml_path)
+            
+            # 2. Transpose MIDI using symusic to prevent music21 MIDI export corruption
+            import symusic
+            sym_score = symusic.Score(midi_path)
+            sym_score.shift_pitch(semitones)
+            sym_score.dump_midi(midi_path)
+            
             print(f"  Saved transposed MIDI and MusicXML.")
         else:
             print("  Score is already in the target key. No transposition needed.")
