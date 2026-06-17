@@ -201,6 +201,7 @@ class VoiceBalanceProcessor(LogitsProcessor):
         self.current_bar = 0
         self.max_silent_bars = max_silent_bars
         self.initialized = False
+        self.tokens_since_last_bar = 0
         
     def scan_prompt(self, input_ids):
         """Scans the prompt on startup to synchronize bar counts and active voice states."""
@@ -221,8 +222,13 @@ class VoiceBalanceProcessor(LogitsProcessor):
         last_token = input_ids[0, -1].item()
         
         # Track bar progression
+        self.tokens_since_last_bar += 1
         if last_token == self.bar_token_id:
             self.current_bar += 1
+            self.tokens_since_last_bar = 0
+        elif self.tokens_since_last_bar >= 100:  # Fallback: assume 1 bar ≈ 100 tokens if Bar_None is missed
+            self.current_bar += 1
+            self.tokens_since_last_bar = 0
         
         # Track which programs are active
         for prog_idx, token_id in self.program_tokens.items():
@@ -456,7 +462,7 @@ def generate_section(model, tokenizer, prompt_ids, max_length, generate_config, 
     prompt_len = len(prompt_ids)
     max_new_tokens = max(16, max_length - prompt_len)
     
-    min_length = max(64, max_length // 2)
+    min_length = max(64, int(max_length * 0.6))
     min_new_tokens = max(8, min_length - prompt_len) if min_length > prompt_len else 8
     
     eos_token_id = tokenizer["EOS_None"] if "EOS_None" in tokenizer else None
@@ -497,6 +503,10 @@ def apply_midi_variation(score):
 
 def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     """Generates an ABA structure using prefix-aligned generation and MIDI-level merging."""
+    # Sanity check for load-bearing coupling with virtual control tokens
+    assert model.config.vocab_size == len(tokenizer) + len(CONTROL_TOKENS), \
+        f"Model vocab_size ({model.config.vocab_size}) does not match tokenizer + control tokens size ({len(tokenizer) + len(CONTROL_TOKENS)}). This is a critical coupling error."
+        
     # Split token budget per section
     section_tokens = generate_config.get("max_length", 4096) // 2
     bos_token_id = tokenizer["BOS_None"] if "BOS_None" in tokenizer else 0
@@ -546,16 +556,31 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     
     # Align and Merge
     align_boundary = get_bar_aligned_ticks(score_ab)
-    score_a_prime.shift_time(align_boundary)
+    
+    # Re-tempo the reprise section to match Section A's initial tempo at the boundary
+    if len(score_a.tempos) > 0:
+        tempo_val = score_a.tempos[0].qpm
+        score_ab.tempos.append(symusic.Tempo(align_boundary, tempo_val))
+        print(f"Set reprise Section A' tempo to {tempo_val:.2f} BPM at tick {align_boundary}.")
     
     print(f"Merging Section A' into the final score at tick {align_boundary}...")
-    for idx, t_ab in enumerate(score_ab.tracks):
-        if idx < len(score_a_prime.tracks):
-            t_prime = score_a_prime.tracks[idx]
+    # Group score_ab tracks by program number to align instruments correctly and avoid mismatches
+    ab_tracks_by_program = {t.program: t for t in score_ab.tracks}
+    
+    for t_prime in score_a_prime.tracks:
+        # Shift the track events directly to avoid duplicate global events
+        t_prime.shift_time(align_boundary)
+        
+        prog = t_prime.program
+        if prog in ab_tracks_by_program:
+            t_ab = ab_tracks_by_program[prog]
             t_ab.notes.extend(t_prime.notes)
             t_ab.controls.extend(t_prime.controls)
             t_ab.pitch_bends.extend(t_prime.pitch_bends)
             t_ab.pedals.extend(t_prime.pedals)
+        else:
+            # If the track doesn't exist in score_ab (e.g. generation dropped it), append it
+            score_ab.tracks.append(t_prime)
             
     return score_ab
 
@@ -619,7 +644,9 @@ def detect_and_mark_ornaments(score):
                 tr = music21.expressions.Trill()
                 main_note.expressions.append(tr)
                 for j in range(i + 1, i + trill_length):
-                    part.remove(notes[j])
+                    n_to_remove = notes[j]
+                    if n_to_remove.activeSite:
+                        n_to_remove.activeSite.remove(n_to_remove)
                 i += trill_length
                 continue
             
@@ -635,8 +662,10 @@ def detect_and_mark_ornaments(score):
                 else:
                     main_note.expressions.append(music21.expressions.Turn())
                     
-                part.remove(notes[i+1])
-                part.remove(notes[i+2])
+                for j in [i+1, i+2]:
+                    n_to_remove = notes[j]
+                    if n_to_remove.activeSite:
+                        n_to_remove.activeSite.remove(n_to_remove)
                 i += 3
                 continue
             i += 1
@@ -684,6 +713,10 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
     model = LlamaForCausalLM.from_pretrained(model_path)
     model.eval()
     
+    # Sanity check for load-bearing coupling with virtual control tokens
+    assert model.config.vocab_size == len(tokenizer) + len(CONTROL_TOKENS), \
+        f"Model vocab_size ({model.config.vocab_size}) does not match tokenizer + control tokens size ({len(tokenizer) + len(CONTROL_TOKENS)}). This is a critical coupling error."
+        
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using inference device: {device.type.upper()}")
     model.to(device)

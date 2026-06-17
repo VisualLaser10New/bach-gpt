@@ -97,7 +97,7 @@ def classify_baroque_tag(filepath):
         "prelude": "PRELUDE", "praeludium": "PRELUDE",
         "fugue": "FUGUE", "fuga": "FUGUE",
         "toccata": "TOCCATA",
-        "gavotte": "TAG_GAVOTTE", # Wait, let's keep the naming aligned with vocabulary
+        "gavotte": "GAVOTTE",
         "aria": "ARIA",
         "passacaglia": "PASSACAGLIA",
         "sarabande": "SARABANDE",

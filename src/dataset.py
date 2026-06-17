@@ -17,6 +17,7 @@ class PackedMusicDataset(Dataset):
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        self.vocab_size = len(tokenizer)
         
         self.packed = []
         buffer = []
@@ -50,11 +51,12 @@ class PackedMusicDataset(Dataset):
                         for t in prefix_tokens:
                             if t in CONTROL_TOKENS:
                                 control_prefix_ids.append(vocab_offset + CONTROL_TOKENS.index(t))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"  Warning: Failed to load control JSON for {filepath}: {e}")
                 
                 # Fallback if no controls
                 if not control_prefix_ids:
+                    print(f"  Note: No control prefix found for {filepath}. Using fallback defaults.")
                     fallback_tokens = ["GENRE_KEYBOARD", "MOOD_ANDANTE", "DENSITY_MODERATE", "V2", "TEMPO_MEDIUM"]
                     from src.control_tokens import CONTROL_TOKENS
                     for t in fallback_tokens:
@@ -77,8 +79,8 @@ class PackedMusicDataset(Dataset):
                 while len(buffer) >= self.max_seq_len:
                     self.packed.append(buffer[:self.max_seq_len])
                     buffer = buffer[self.max_seq_len:]
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  Error: Failed to process MIDI file {filepath}: {e}")
                 
         # Don't waste short tails
         if len(buffer) > self.max_seq_len // 4:
@@ -90,10 +92,14 @@ class PackedMusicDataset(Dataset):
         
     def __getitem__(self, idx):
         ids = self.packed[idx]
+        labels = [
+            -100 if (t == self.pad_token_id or t == self.bos_token_id or t >= self.vocab_size)
+            else t for t in ids
+        ]
         return {
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "attention_mask": torch.tensor([1 if t != self.pad_token_id else 0 for t in ids], dtype=torch.long),
-            "labels": torch.tensor(ids, dtype=torch.long)
+            "labels": torch.tensor(labels, dtype=torch.long)
         }
 
 def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val_split=0.1):

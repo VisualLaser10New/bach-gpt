@@ -3,7 +3,7 @@ import sys
 import argparse
 from src.config import (
     DATASET_DIR, PROCESSED_DIR, CHECKPOINT_DIR, OUTPUT_DIR,
-    MODEL_CONFIG, TRAIN_CONFIG, GENERATE_CONFIG
+    MODEL_CONFIG, TRAIN_CONFIG, GENERATE_CONFIG, TOKENIZER_PATH
 )
 from src.data_prep import prepare_dataset, get_midi_files
 from src.tokenizer import get_tokenizer
@@ -123,6 +123,15 @@ def main():
     if force_rebuild:
         print("Starting a fresh run. Rebuilding tokenizer from scratch on mapped files...")
     tokenizer = get_tokenizer(tokenizer_files, force_rebuild=force_rebuild)
+    
+    # Copy tokenizer.json to /kaggle/working/ for easy download if running on Kaggle
+    if os.path.exists("/kaggle/working") and os.path.isdir("/kaggle/working"):
+        try:
+            import shutil
+            shutil.copy(TOKENIZER_PATH, os.path.join("/kaggle/working", "tokenizer.json"))
+            print("Copied tokenizer.json to /kaggle/working/ for easy download.")
+        except Exception as e:
+            print(f"Warning: Could not copy tokenizer.json to /kaggle/working/: {e}")
     
     # Phase 3: DataLoader Preparation
     print("\n--- Phase 3: Preparing PyTorch DataLoaders ---")
