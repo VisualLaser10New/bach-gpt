@@ -211,19 +211,19 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
             decoded_midi.tempos.append(symusic.Tempo(0, initial_qpm))
             print(f"Cleaned tempo changes. Enforced a stable constant tempo of {initial_qpm:.2f} BPM.")
             
-        # Re-map tracks to requested instruments in order (avoiding out-of-distribution logits issues)
+        # Re-map tracks to requested instruments, cycling through them if there are more tracks than instruments
         if program_ids and hasattr(decoded_midi, "tracks"):
             print(f"Applying custom instrument re-mapping for tracks: {program_ids}")
             for i, track in enumerate(decoded_midi.tracks):
-                if i < len(program_ids):
-                    old_prog = track.program
-                    new_prog = program_ids[i]
-                    track.program = new_prog
-                    
-                    # Set a descriptive track name based on program number
-                    names = [k for k, v in INSTRUMENT_TO_PROGRAM.items() if v == new_prog]
-                    track.name = names[0].title() if names else f"Voice {i+1}"
-                    print(f"  Track {i}: Remapped Program {old_prog} -> Program {new_prog} ({track.name})")
+                old_prog = track.program
+                # Cycle through the requested instruments
+                new_prog = program_ids[i % len(program_ids)]
+                track.program = new_prog
+                
+                # Set a descriptive track name based on program number
+                names = [k for k, v in INSTRUMENT_TO_PROGRAM.items() if v == new_prog]
+                track.name = names[0].title() if names else f"Voice {i+1}"
+                print(f"  Track {i}: Remapped Program {old_prog} -> Program {new_prog} ({track.name})")
         
         # Save MIDI file
         os.makedirs(os.path.dirname(output_midi_path), exist_ok=True)
