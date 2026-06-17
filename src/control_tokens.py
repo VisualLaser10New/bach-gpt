@@ -8,7 +8,7 @@ CONTROL_TOKENS = [
     "MOOD_VIVACE", "MOOD_ALLEGRO", "MOOD_ANDANTE", "MOOD_ADAGIO",
     "MOOD_LENTO", "MOOD_MAESTOSO", "MOOD_GRAZIOSO",
     "DENSITY_SPARSE", "DENSITY_MODERATE", "DENSITY_DENSE",
-    "V2", "V3", "V4", "V5", "V6", "V8", "V10",
+    "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10",
     "TEMPO_SLOW", "TEMPO_MEDIUM", "TEMPO_FAST",
     "TAG_MINUETTO", "TAG_PRELUDE", "TAG_FUGUE", "TAG_TOCCATA",
     "TAG_GAVOTTE", "TAG_ARIA", "TAG_PASSACAGLIA", "TAG_SARABANDE",
@@ -144,8 +144,8 @@ def analyze_piece(score, filepath):
     if len(score.key_signatures) > 0:
         # Check if mode is minor
         ks = score.key_signatures[0]
-        # In symusic, key signature mode can be major/minor (represented as minor=True/False)
-        mode_is_minor = getattr(ks, "minor", False)
+        # In symusic, key signature mode is represented as tonality (0 = major, 1 = minor)
+        mode_is_minor = bool(getattr(ks, "tonality", 0))
     else:
         # Fallback: minor if 'm' or 'min' in filename or key representation
         basename = os.path.basename(filepath).lower()
@@ -167,7 +167,7 @@ def analyze_piece(score, filepath):
     mood = classify_mood(avg_tempo, mode_is_minor, notes_per_beat)
     
     # Voices count mapping to control tokens (V2, V3, etc.)
-    voices_map = {1: "V2", 2: "V2", 3: "V3", 4: "V4", 5: "V5", 6: "V6", 7: "V6", 8: "V8", 9: "V8", 10: "V10"}
+    voices_map = {1: "V2", 2: "V2", 3: "V3", 4: "V4", 5: "V5", 6: "V6", 7: "V7", 8: "V8", 9: "V9", 10: "V10"}
     voices_token = voices_map.get(num_tracks, "V4")
     if num_tracks > 10:
         voices_token = "V10"

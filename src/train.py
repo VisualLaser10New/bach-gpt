@@ -30,7 +30,8 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
     # Learning rate scheduler details
     accum_steps = train_config.get("gradient_accumulation_steps", 8)
     batches_per_epoch = len(train_loader)
-    total_optim_steps = (batches_per_epoch // accum_steps) * train_config["num_epochs"]
+    steps_per_epoch = (batches_per_epoch + accum_steps - 1) // accum_steps
+    total_optim_steps = steps_per_epoch * train_config["num_epochs"]
     warmup_steps = int(total_optim_steps * 0.05) # 5% warmup
     
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_optim_steps)
@@ -80,21 +81,25 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
                     attention_mask=attention_mask,
                     labels=labels
                 )
-                loss = outputs.loss / accum_steps
+                
+                # Correct loss scaling for partial steps at the end of the epoch
+                is_last_step = (step + 1) == len(train_loader)
+                current_accum_steps = accum_steps if not is_last_step else (len(train_loader) % accum_steps or accum_steps)
+                loss = outputs.loss / current_accum_steps
                 
             # Backward pass
             scaler.scale(loss).backward()
             
             # Optimization step
-            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+            if (step + 1) % accum_steps == 0 or is_last_step:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
                 
-            total_train_loss += loss.item() * accum_steps
+            total_train_loss += loss.item() * current_accum_steps
             train_steps += 1
-            train_bar.set_postfix({"Loss": f"{(loss.item() * accum_steps):.4f}"})
+            train_bar.set_postfix({"Loss": f"{(loss.item() * current_accum_steps):.4f}"})
             
         avg_train_loss = total_train_loss / train_steps
         

@@ -1,7 +1,7 @@
-torch
-music21
-miditok
-transformers
+torch>=2.0
+music21==10.3.0
+miditok>=3.0
+transformers==5.12.1
 tqdm
-symusic
+symusic==0.6.0
 sentencepiece

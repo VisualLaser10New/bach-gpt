@@ -189,9 +189,9 @@ class VoiceBalanceProcessor(LogitsProcessor):
     If a voice is silent for more than N bars, progressively boost its 
     Program_X token logit to force re-entry.
     """
-    def __init__(self, tokenizer, num_voices, max_silent_bars=4):
+    def __init__(self, tokenizer, max_silent_bars=4):
         self.program_tokens = {}
-        for i in range(num_voices):
+        for i in range(16):  # General MIDI supports up to 16 channels
             token_name = f"Program_{i}"
             if token_name in tokenizer.vocab:
                 self.program_tokens[i] = tokenizer[token_name]
@@ -318,32 +318,6 @@ def group_keyboard_staves(score):
         sg = music21.layout.StaffGroup(group_parts, name=name, symbol="brace")
         score.insert(0, sg)
 
-def transpose_to_target_key(midi_path, xml_path, target_key_str):
-    """Detects the key of the generated score and transposes it to the target key."""
-    if not target_key_str:
-        return
-    print(f"Detecting key of the generated music...")
-    try:
-        score = music21.converter.parse(midi_path)
-        detected_key = score.analyze('key')
-        print(f"  Detected key: {detected_key.name} (confidence: {detected_key.correlationCoefficient:.2f})")
-        target_key = parse_key_string(target_key_str)
-        print(f"  Target key: {target_key.name}")
-        interval = music21.interval.Interval(detected_key.tonic, target_key.tonic)
-        semitones = interval.semitones
-        if semitones != 0:
-            print(f"  Transposing score by {semitones} semitones ({detected_key.tonic.name} -> {target_key.tonic.name})...")
-            group_keyboard_staves(score)
-            transposed_score = score.transpose(interval)
-            transposed_score.write('musicxml', fp=xml_path)
-            sym_score = symusic.Score(midi_path)
-            sym_score.shift_pitch(semitones)
-            sym_score.dump_midi(midi_path)
-            print(f"  Saved transposed MIDI and MusicXML.")
-        else:
-            print("  Score is already in the target key. No transposition needed.")
-    except Exception as e:
-        print(f"  Warning: Key transposition failed: {e}")
 
 def load_input_json(file_path):
     """Loads input configuration from a JSON file."""
@@ -430,29 +404,32 @@ def build_contrast_prefix_tokens(user_inputs):
         tempo = user_inputs.get("tempo")
         if tempo:
             try:
-                inputs_b["tempo"] = int(int(tempo) * 0.7)
+                # Clamp tempo to slow region (< 80 bpm) to prevent contradictory conditioning
+                inputs_b["tempo"] = min(75, int(int(tempo) * 0.7))
             except ValueError:
                 inputs_b["tempo"] = 70
+        else:
+            inputs_b["tempo"] = 70
     else:
         inputs_b["mood"] = "allegro"
         inputs_b["density"] = "dense"
         tempo = user_inputs.get("tempo")
         if tempo:
             try:
-                inputs_b["tempo"] = int(int(tempo) * 1.3)
+                # Clamp tempo to fast/medium region (>= 110 bpm) to prevent contradictory conditioning
+                inputs_b["tempo"] = max(110, int(int(tempo) * 1.3))
             except ValueError:
                 inputs_b["tempo"] = 120
+        else:
+            inputs_b["tempo"] = 120
     if "baroque_tag" in inputs_b:
         del inputs_b["baroque_tag"]
     return build_control_prefix_tokens(inputs_b)
 
 def generate_section(model, tokenizer, prompt_ids, max_length, generate_config, user_inputs, device):
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    num_voices = count_total_staves(user_inputs.get("instruments", ["piano"]))
-    
     voice_processor = VoiceBalanceProcessor(
         tokenizer=tokenizer,
-        num_voices=num_voices,
         max_silent_bars=generate_config.get("max_silent_bars", 4)
     )
     
@@ -497,8 +474,17 @@ def get_bar_aligned_ticks(score):
 def apply_midi_variation(score):
     score_prime = copy.deepcopy(score)
     for track in score_prime.tracks:
-        for note in track.notes:
-            note.velocity = max(20, min(127, int(note.velocity * random.uniform(0.9, 1.1))))
+        # Group note indices by start time so chords shift together (Fix A)
+        time_groups = {}
+        for n in track.notes:
+            time_groups.setdefault(n.time, []).append(n)
+        for time_val, group in time_groups.items():
+            shared_offset = random.randint(-12, 12)
+            for n in group:
+                n.velocity = max(20, min(127, int(n.velocity * random.uniform(0.9, 1.1))))
+                n.time = max(0, time_val + shared_offset)
+                if n.duration > 60:  # skip grace/ornament notes
+                    n.duration = max(24, int(n.duration * random.uniform(0.95, 1.05)))
     return score_prime
 
 def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
@@ -524,7 +510,15 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     
     # === SECTION B ===
     print("Generating Section B (Contrasting Section)...")
-    bridge_tokens = section_a[-256:]
+    # Strip prompt, EOS, and PAD from Section A before slicing the bridge
+    eos_id = tokenizer["EOS_None"] if "EOS_None" in tokenizer else None
+    pad_id = tokenizer["PAD_None"] if "PAD_None" in tokenizer else tokenizer.pad_token_id
+    clean_section_a = [
+        t for t in section_a[len(prompt_a):] 
+        if t != eos_id and t != pad_id
+    ]
+    bridge_tokens = clean_section_a[-256:] if len(clean_section_a) >= 256 else clean_section_a
+    
     contrast_prefix = build_contrast_prefix_tokens(user_inputs)
     prompt_b_ids = []
     for t in contrast_prefix:
@@ -569,7 +563,7 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     
     for t_prime in score_a_prime.tracks:
         # Shift the track events directly to avoid duplicate global events
-        t_prime.shift_time(align_boundary)
+        t_prime = t_prime.shift_time(align_boundary)
         
         prog = t_prime.program
         if prog in ab_tracks_by_program:
@@ -581,6 +575,10 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
         else:
             # If the track doesn't exist in score_ab (e.g. generation dropped it), append it
             score_ab.tracks.append(t_prime)
+            
+    # Sort all events to ensure MIDI/XML output is chronologically ordered
+    if hasattr(score_ab, "sort"):
+        score_ab.sort()
             
     return score_ab
 
@@ -645,7 +643,10 @@ def detect_and_mark_ornaments(score):
                 main_note.expressions.append(tr)
                 for j in range(i + 1, i + trill_length):
                     n_to_remove = notes[j]
-                    if n_to_remove.activeSite:
+                    measure = n_to_remove.getContextByClass('Measure')
+                    if measure:
+                        measure.remove(n_to_remove)
+                    elif n_to_remove.activeSite:
                         n_to_remove.activeSite.remove(n_to_remove)
                 i += trill_length
                 continue
@@ -664,7 +665,10 @@ def detect_and_mark_ornaments(score):
                     
                 for j in [i+1, i+2]:
                     n_to_remove = notes[j]
-                    if n_to_remove.activeSite:
+                    measure = n_to_remove.getContextByClass('Measure')
+                    if measure:
+                        measure.remove(n_to_remove)
+                    elif n_to_remove.activeSite:
                         n_to_remove.activeSite.remove(n_to_remove)
                 i += 3
                 continue
@@ -756,10 +760,8 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         prompt_tokens = [bos_token_id] + prompt_tokens_ids
         input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
         
-        num_voices = count_total_staves(instruments)
         voice_processor = VoiceBalanceProcessor(
             tokenizer=tokenizer,
-            num_voices=num_voices,
             max_silent_bars=generate_config.get("max_silent_bars", 4)
         )
         from transformers import LogitsProcessorList
@@ -767,7 +769,7 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         
         prompt_len = len(prompt_tokens)
         max_new_tokens = max(16, generate_config["max_length"] - prompt_len)
-        min_new_tokens = max(8, max(256, generate_config["max_length"] - 64) - prompt_len)
+        min_new_tokens = max(8, int(generate_config["max_length"] * 0.5) - prompt_len)
         
         with torch.no_grad():
             generation_output = model.generate(
@@ -846,16 +848,24 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
     num_slots = len(slots)
     print(f"Applying custom instrument re-mapping. Distributing {num_tracks} tracks into {num_slots} slots...")
     
+    if num_slots != num_tracks:
+        print(f"  Warning: Track count mismatch! Requested {num_slots} instrument slots, but model generated {num_tracks} tracks.")
+        
     new_tracks = []
     if num_slots >= num_tracks:
-        for idx in range(num_tracks):
+        for idx in range(num_slots):
             slot = slots[idx]
-            track = decoded_midi.tracks[idx]
-            track.program = slot["program"]
-            track.name = slot["track_name"]
-            min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
-            fit_track_to_range(track, min_p, max_p)
-            new_tracks.append(track)
+            if idx < num_tracks:
+                track = decoded_midi.tracks[idx]
+                track.program = slot["program"]
+                track.name = slot["track_name"]
+                min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
+                fit_track_to_range(track, min_p, max_p)
+                new_tracks.append(track)
+            else:
+                # Append an empty silent track for the missing slot (Bug #13) so it is still represented in the score
+                empty_track = symusic.Track(program=slot["program"], name=slot["track_name"])
+                new_tracks.append(empty_track)
     else:
         indices_split = python_array_split(range(num_tracks), num_slots)
         for slot_idx, slot in enumerate(slots):
@@ -880,10 +890,57 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         decoded_midi.write(output_midi_path)
     print(f"Saved generated MIDI to {output_midi_path}")
     
+    # Handle Key Transposition (Component 4, Bug 4, and Bug 11)
+    if user_inputs and user_inputs.get("key"):
+        print("Analyzing key of generated music...")
+        try:
+            temp_score = music21.converter.parse(output_midi_path)
+            detected_key = temp_score.analyze('key')
+            print(f"  Detected key: {detected_key.name} (confidence: {detected_key.correlationCoefficient:.2f})")
+            
+            target_key = parse_key_string(user_inputs["key"])
+            target_mode = detected_key.mode  # Preserve original mode
+            aligned_target_key = music21.key.Key(target_key.tonic, target_mode)
+            
+            if detected_key.mode != target_key.mode:
+                print(f"  Note: Mode mismatch (detected {detected_key.mode} vs target {target_key.mode}). "
+                      f"Preserving generated mode and transposing to {aligned_target_key.name}.")
+            else:
+                print(f"  Target key: {aligned_target_key.name}")
+                
+            interval = music21.interval.Interval(detected_key.tonic, aligned_target_key.tonic)
+            semitones = interval.semitones
+            if semitones != 0:
+                decoded_midi = decoded_midi.shift_pitch(semitones)
+                # Re-save the transposed MIDI file
+                if hasattr(decoded_midi, "dump_midi"):
+                    decoded_midi.dump_midi(output_midi_path)
+                else:
+                    decoded_midi.write(output_midi_path)
+                print(f"  Transposed in-memory score and saved MIDI by {semitones} semitones.")
+        except Exception as e:
+            print(f"  Warning: Key transposition failed: {e}")
+
     # Export to MusicXML
     print("Converting MIDI output to MusicXML sheet music format...")
     try:
         score = music21.converter.parse(output_midi_path)
+        
+        # Inject empty parts for missing instrument slots (Fix B)
+        existing_parts = len(score.parts)
+        if existing_parts < num_slots:
+            print(f"  Injecting {num_slots - existing_parts} empty parts for missing instruments...")
+            for slot in slots[existing_parts:]:
+                empty_part = music21.stream.Part()
+                empty_part.partName = slot["track_name"]
+                # Insert a default instrument so MusicXML has a valid score-part
+                inst = music21.instrument.Instrument()
+                inst.midiProgram = slot["program"]
+                empty_part.insert(0, inst)
+                # Insert an empty measure so the part renders in MuseScore
+                empty_part.append(music21.stream.Measure())
+                score.append(empty_part)
+                
         group_keyboard_staves(score)
         
         # Ornament Detection
@@ -903,10 +960,6 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         print(f"Saved sheet music to {output_xml_path}")
     except Exception as e:
         print(f"Failed to convert MIDI to MusicXML: {e}")
-        
-    # Transpose to target key signature
-    if user_inputs and user_inputs.get("key"):
-        transpose_to_target_key(output_midi_path, output_xml_path, user_inputs["key"])
 
 if __name__ == "__main__":
     from src.config import CHECKPOINT_DIR, GENERATE_CONFIG, OUTPUT_DIR, BASE_DIR

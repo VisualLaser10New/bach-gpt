@@ -42,13 +42,15 @@ def download_builtin_bach_corpus(target_dir):
             
     print(f"Successfully extracted {success_count} Bach files to {target_dir}")
 
-def transpose_midi(midi_path, output_dir, semitones_list=[-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]):
+def transpose_midi(midi_path, output_dir, semitones_list=None):
     """
     Transpose a MIDI file into specified keys
     and save them to output_dir using symusic (extremely fast C++ parser).
     Also assigns a unique program number to each track to preserve voice identity.
     Saves a metadata sidecar json mapping control tokens for the piece.
     """
+    if semitones_list is None:
+        semitones_list = [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
     try:
         score = symusic.Score(midi_path)
         
@@ -76,9 +78,7 @@ def transpose_midi(midi_path, output_dir, semitones_list=[-6, -5, -4, -3, -2, -1
             if semitones == 0:
                 score.dump_midi(out_path)
             else:
-                # Create a copy and shift pitch
-                transposed_score = copy.deepcopy(score)
-                transposed_score.shift_pitch(semitones)
+                transposed_score = score.shift_pitch(semitones)
                 transposed_score.dump_midi(out_path)
     except Exception as e:
         print(f"Failed to transpose {midi_path} using symusic: {e}")
@@ -89,12 +89,14 @@ def _transpose_worker(args):
     midi_path, output_dir, semitones_list = args
     transpose_midi(midi_path, output_dir, semitones_list)
 
-def prepare_dataset(raw_dir, processed_dir, semitones_list=[-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]):
+def prepare_dataset(raw_dir, processed_dir, semitones_list=None):
     """
     Main preprocessing pipeline:
     1. Checks if raw_dir is empty. If so, downloads/extracts default Bach files.
     2. Transposes all files in raw_dir into processed_dir in parallel.
     """
+    if semitones_list is None:
+        semitones_list = [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
     

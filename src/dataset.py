@@ -83,7 +83,7 @@ class PackedMusicDataset(Dataset):
                 print(f"  Error: Failed to process MIDI file {filepath}: {e}")
                 
         # Don't waste short tails
-        if len(buffer) > self.max_seq_len // 4:
+        if len(buffer) > 0:
             padded_buffer = buffer + [self.pad_token_id] * (self.max_seq_len - len(buffer))
             self.packed.append(padded_buffer)
             
