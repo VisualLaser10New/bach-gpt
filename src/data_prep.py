@@ -4,8 +4,10 @@ import shutil
 import music21
 import symusic
 import copy
+import json
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
+from src.control_tokens import analyze_piece
 
 def get_midi_files(directory):
     """Recursively list all MIDI files in a directory, deduplicating paths to handle case-insensitivity."""
@@ -45,6 +47,7 @@ def transpose_midi(midi_path, output_dir, semitones_list=[-6, -5, -4, -3, -2, -1
     Transpose a MIDI file into specified keys
     and save them to output_dir using symusic (extremely fast C++ parser).
     Also assigns a unique program number to each track to preserve voice identity.
+    Saves a metadata sidecar json mapping control tokens for the piece.
     """
     try:
         score = symusic.Score(midi_path)
@@ -55,6 +58,15 @@ def transpose_midi(midi_path, output_dir, semitones_list=[-6, -5, -4, -3, -2, -1
             
         base_name = os.path.splitext(os.path.basename(midi_path))[0]
         
+        # Analyze original piece and save control metadata sidecar
+        try:
+            metadata = analyze_piece(score, midi_path)
+            meta_path = os.path.join(output_dir, f"{base_name}.control.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            print(f"Failed to analyze control metadata for {midi_path}: {e}")
+            
         # Transpose to requested semitones
         for semitones in semitones_list:
             suffix = f"_transposed_{semitones}" if semitones != 0 else ""
@@ -70,6 +82,7 @@ def transpose_midi(midi_path, output_dir, semitones_list=[-6, -5, -4, -3, -2, -1
                 transposed_score.dump_midi(out_path)
     except Exception as e:
         print(f"Failed to transpose {midi_path} using symusic: {e}")
+
 
 # Module-level helper for ProcessPoolExecutor pickling
 def _transpose_worker(args):

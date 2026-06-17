@@ -10,43 +10,46 @@ paths:
 tokenizer:
   pitch_range: [21, 109]            # Piano pitch range (A0 to C8)
   beat_res:
-    "0,4": 4                        # 4 steps per beat (sixteenth notes)
-  num_velocities: 8                 # Quantize velocity into 8 bins (dynamics)
+    "0,4": 8                        # 32nd note resolution (trills, mordents)
+    "4,12": 4                       # 16th notes for regular beats
+  num_velocities: 16                # Quantize velocity into 16 bins (dynamics)
   use_chords: true                  # Recognize chords
   use_rests: true                   # Represent rests explicitly
   rest_range: [0.25, 8.0]           # Minimum rest size is 1/4 beat, max is 8 beats
   beat_res_rest:
-    "0,4": 4                        # Rest resolution (must match beat_res)
+    "0,4": 8
+    "4,12": 4
   use_tempos: true                  # Represent tempo changes
-  use_time_signatures: false        # Keep time signatures simple (4/4 assumed)
+  use_time_signatures: true         # Enable 3/4, 6/8, 4/4 learning
   use_programs: true                # Identify different channels/instruments (tracks)
 
-# Model Configuration (Upscaled GPT-2 for GPU training)
+# Model Configuration (Custom LLaMA for Baroque Music)
 model:
   vocab_size: null                  # Will be set dynamically based on tokenizer
-  n_positions: 1024                 # Context window (sequence length) (Updated from 512)
-  n_embd: 384                       # Embedding dimension (upscaled from 256)
-  n_layer: 6                        # Number of Transformer layers (upscaled from 4)
-  n_head: 12                        # Number of attention heads (upscaled from 8)
-  bos_token_id: null                # Will be set from tokenizer
-  eos_token_id: null                # Will be set from tokenizer
-  pad_token_id: null                # Will be set from tokenizer
+  n_positions: 4096                 # Context window (sequence length)
+  n_embd: 768                       # Hidden dimension
+  intermediate_size: 2048           # FFN intermediate (SwiGLU)
+  n_layer: 10                       # Transformer layers
+  n_head: 12                        # Attention heads
+  n_kv_head: 12                     # Key/value heads (no GQA)
 
-# Training Configuration (Optimized for GPU)
+# Training Configuration (Optimized for T4 VRAM)
 training:
-  batch_size: 32                    # Batch size (increased to 32 for GPU memory/cores efficiency)
-  learning_rate: 0.0005             # Learning rate
-  num_epochs: 20                    # Number of epochs (increased to 20 for better convergence)
+  batch_size: 4                     # Actual GPU micro-batch
+  gradient_accumulation_steps: 8    # Effective batch = 32
+  learning_rate: 0.0003             # Learning rate for cosine scheduler
+  num_epochs: 20                    # Number of epochs
   weight_decay: 0.01                # Regularization
   save_steps: 500                   # Save checkpoint every N steps
   logging_steps: 50                 # Log every N steps
   seed: 42
-  transposition_keys: [-3, -2, -1, 0, 1, 2]  # Semitone offsets for data augmentation (6x instead of 12x)
+  transposition_keys: [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6]  # 12 keys (full chromatic)
 
 # Inference Configuration
 generate:
-  max_length: 1024                  # Max tokens to generate (Updated from 512)
-  temperature: 0.65                # Creativity (lower = more structured/coherent)
-  top_p: 0.9                        # Nucleus sampling threshold
-  top_k: 10                         # Filter out low-probability tokens
-  repetition_penalty: 1.0           # No repetition penalty (prevents timeline progression blockage)
+  max_length: 4096                  # Max tokens to generate
+  temperature: 0.72                 # Slightly lower for structural cohesion
+  top_p: 0.92                       # Nucleus sampling threshold
+  top_k: 30                         # Filter out low-probability tokens
+  repetition_penalty: 1.0           # Repetition penalty (1.0 = none)
+

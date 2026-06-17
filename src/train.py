@@ -1,16 +1,24 @@
 import os
 import torch
 from torch.optim import AdamW
+from torch.amp import autocast, GradScaler
+from transformers import get_cosine_schedule_with_warmup
 from tqdm import tqdm
 
 def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, start_epoch=1):
     """
-    Standard PyTorch training loop with CUDA GPU support.
-    Automatically detects and runs on CUDA GPU if available.
+    Standard PyTorch training loop with CUDA GPU support, gradient accumulation,
+    mixed precision training (AMP), gradient checkpointing, and cosine scheduler.
+    Saves and restores full training state for multi-session checkpointing.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting training. Using device: {device.type.upper()}")
     model.to(device)
+    
+    # Enable gradient checkpointing to save memory
+    if device.type == "cuda":
+        print("Enabling gradient checkpointing...")
+        model.gradient_checkpointing_enable()
     
     # Initialize Optimizer
     optimizer = AdamW(
@@ -19,10 +27,36 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         weight_decay=train_config["weight_decay"]
     )
     
+    # Learning rate scheduler details
+    accum_steps = train_config.get("gradient_accumulation_steps", 8)
+    batches_per_epoch = len(train_loader)
+    total_optim_steps = (batches_per_epoch // accum_steps) * train_config["num_epochs"]
+    warmup_steps = int(total_optim_steps * 0.05) # 5% warmup
+    
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_optim_steps)
+    
+    # AMP Gradient Scaler
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+    
     best_val_loss = float("inf")
     num_epochs = train_config["num_epochs"]
     
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader) if val_loader else 0}")
+    # Check if there is an existing training state to load
+    state_path = os.path.join(checkpoint_dir, "training_state.pt")
+    if start_epoch > 1 and os.path.exists(state_path):
+        print(f"Loading training state from {state_path}...")
+        try:
+            state = torch.load(state_path, map_location=device)
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            scaler.load_state_dict(state["scaler"])
+            best_val_loss = state.get("best_val_loss", float("inf"))
+            print("Successfully restored optimizer, scheduler, and scaler states.")
+        except Exception as e:
+            print(f"Warning: Failed to restore training state: {e}. Starting fresh.")
+            
+    print(f"Train batches: {batches_per_epoch}, Val batches: {len(val_loader) if val_loader else 0}")
+    print(f"Effective batch size: {train_config['batch_size'] * accum_steps} (Micro-batch: {train_config['batch_size']}, Accumulation: {accum_steps})")
     
     for epoch in range(start_epoch, num_epochs + 1):
         # --- TRAINING PHASE ---
@@ -30,30 +64,37 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         total_train_loss = 0
         train_steps = 0
         
+        optimizer.zero_grad()
+        
         train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [Train]")
-        for batch in train_bar:
-            optimizer.zero_grad()
-            
-            # Unpack batch onto active device (CPU or GPU)
+        for step, batch in enumerate(train_bar):
+            # Unpack batch onto active device
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             
-            # Forward pass
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            loss = outputs.loss
-            
+            # Forward pass with mixed precision
+            with autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                loss = outputs.loss / accum_steps
+                
             # Backward pass
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
             
-            total_train_loss += loss.item()
+            # Optimization step
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+                
+            total_train_loss += loss.item() * accum_steps
             train_steps += 1
-            train_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            train_bar.set_postfix({"Loss": f"{(loss.item() * accum_steps):.4f}"})
             
         avg_train_loss = total_train_loss / train_steps
         
@@ -70,11 +111,12 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
+                    with autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels
+                        )
                     total_val_loss += outputs.loss.item()
                     val_steps += 1
                     
@@ -99,4 +141,15 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         os.makedirs(epoch_path, exist_ok=True)
         model.save_pretrained(epoch_path)
         
+        # Save training state (optimizer, scheduler, scaler) for checkpoint resuming
+        torch.save({
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss
+        }, state_path)
+        print(f"Saved training state to {state_path}")
+        
     print("Training finished successfully!")
+

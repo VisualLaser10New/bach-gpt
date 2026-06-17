@@ -138,11 +138,28 @@ def main():
     print("\n--- Phase 4: Initializing/Resuming Transformer Model ---")
     if latest_epoch_path:
         print(f"Found existing checkpoint. Resuming training from {latest_epoch_path} (Starting at Epoch {start_epoch})...")
-        from transformers import GPT2LMHeadModel
-        model = GPT2LMHeadModel.from_pretrained(latest_epoch_path)
+        # Add check to verify architecture mismatch
+        config_file_path = os.path.join(latest_epoch_path, "config.json")
+        if os.path.exists(config_file_path):
+            import json
+            try:
+                with open(config_file_path, "r", encoding="utf-8") as f:
+                    cfg_data = json.load(f)
+                if cfg_data.get("model_type") == "gpt2":
+                    print("\n" + "="*80)
+                    print("CRITICAL ERROR: Detected existing checkpoint of type 'gpt2'.")
+                    print("The project architecture has been updated to LLaMA.")
+                    print("Please run with --reset to wipe old checkpoints and start training from scratch.")
+                    print("="*80 + "\n")
+                    sys.exit(1)
+            except Exception:
+                pass
+        from transformers import LlamaForCausalLM
+        model = LlamaForCausalLM.from_pretrained(latest_epoch_path)
     else:
         print("No existing checkpoints found. Initializing new model weights...")
         model = get_model(tokenizer, model_config)
+
         
     # Save the initialized model configuration/weights so inference script can load it
     best_model_path = os.path.join(checkpoint_dir, "best_model")

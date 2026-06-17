@@ -4,3 +4,4 @@ miditok
 transformers
 tqdm
 symusic
+sentencepiece

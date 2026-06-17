@@ -21,13 +21,13 @@ def get_tokenizer(files_paths=None, force_rebuild=False):
     if files_paths:
         print(f"Training Byte Pair Encoding (BPE) tokenizer on {len(files_paths)} files...")
         base_vocab_size = len(tokenizer.vocab)
-        target_vocab_size = base_vocab_size + 1500
+        target_vocab_size = base_vocab_size + 2000
         print(f"Base vocabulary size: {base_vocab_size}, Target vocabulary size: {target_vocab_size}")
         
         # Convert path strings to pathlib.Path objects for compatibility
         path_objects = [Path(p) for p in files_paths]
         
-        # Using modern miditok v3.0 methods (train instead of learn_bpe, save instead of save_params)
+        # Using BPE training
         tokenizer.train(vocab_size=target_vocab_size, files_paths=path_objects)
         tokenizer.save(TOKENIZER_PATH)
         print(f"Saved trained BPE tokenizer to {TOKENIZER_PATH}")
