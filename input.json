@@ -1,8 +1,9 @@
 {
   "instruments": [
-    "flute",
+    "violin",
+    "oboe",
     "harpsichord"
   ],
-  "tempo": 90,
-  "key": "G maj"
+  "tempo": 150,
+  "key": "D min"
 }
