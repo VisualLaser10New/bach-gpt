@@ -104,17 +104,34 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
     # Filter files_paths to only include MIDI files (excluding control JSON files)
     midi_files = [Path(f) for f in files_paths if os.path.splitext(str(f))[1].lower() in ['.mid', '.midi']]
     
-    # Shuffle and split into Train / Validation sets
+    # Group files by their original base name to prevent data leakage
+    grouped_files = {}
+    for f in midi_files:
+        original_base = re.sub(r"_transposed_[-+]?\d+$", "", f.stem)
+        if original_base not in grouped_files:
+            grouped_files[original_base] = []
+        grouped_files[original_base].append(f)
+        
+    # Shuffle and split original pieces
+    unique_pieces = list(grouped_files.keys())
     random.seed(42)
-    sorted_files = sorted(list(midi_files))
-    random.shuffle(sorted_files)
+    sorted_pieces = sorted(unique_pieces)
+    random.shuffle(sorted_pieces)
     
-    val_size = int(len(sorted_files) * val_split)
-    if val_size == 0 and len(sorted_files) > 1 and val_split > 0:
+    val_size = int(len(sorted_pieces) * val_split)
+    if val_size == 0 and len(sorted_pieces) > 1 and val_split > 0:
         val_size = 1
         
-    val_paths = sorted_files[:val_size]
-    train_paths = sorted_files[val_size:]
+    val_pieces = sorted_pieces[:val_size]
+    train_pieces = sorted_pieces[val_size:]
+    
+    val_paths = []
+    for p in val_pieces:
+        val_paths.extend(grouped_files[p])
+        
+    train_paths = []
+    for p in train_pieces:
+        train_paths.extend(grouped_files[p])
     
     print(f"Dataset split: {len(train_paths)} training files, {len(val_paths)} validation files.")
     

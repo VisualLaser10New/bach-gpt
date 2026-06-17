@@ -4,6 +4,11 @@
     "oboe",
     "harpsichord"
   ],
-  "tempo": 150,
-  "key": "D min"
+  "tempo": 120,
+  "key": "D min",
+  "mood": "vivace",
+  "genre": "concerto",
+  "density": "moderate",
+  "baroque_tag": "prelude",
+  "form": "ABA"
 }
