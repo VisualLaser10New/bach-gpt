@@ -1,8 +1,12 @@
 import os
+import json
+import re
 import torch
+import music21
+import symusic
+import copy
 from transformers import GPT2LMHeadModel
 from miditok import TokSequence
-import music21
 
 # General MIDI Instrument mappings to Program Numbers
 INSTRUMENT_TO_PROGRAM = {
@@ -86,6 +90,95 @@ INSTRUMENT_TO_PROGRAM = {
     "shana": 111,
 }
 
+# Keyboard instruments that require Right Hand (Treble) and Left Hand (Bass) staves
+KEYBOARD_INSTRUMENTS = {
+    "piano", "acoustic grand piano", "bright acoustic piano", "electric grand piano", 
+    "honky-tonk piano", "electric piano", "harpsichord", "harpsicord", "clavier", 
+    "cembalo", "clavinet", "celesta", "church organ", "organ", "reed organ"
+}
+
+# Physical pitch ranges for instruments (min_note, max_note)
+INSTRUMENT_RANGES = {
+    "piano": (21, 108),
+    "acoustic grand piano": (21, 108),
+    "bright acoustic piano": (21, 108),
+    "electric grand piano": (21, 108),
+    "honky-tonk piano": (21, 108),
+    "electric piano": (21, 108),
+    "harpsichord": (21, 89),
+    "harpsicord": (21, 89),
+    "clavier": (21, 89),
+    "cembalo": (21, 89),
+    "clavinet": (21, 89),
+    "celesta": (21, 89),
+    "glockenspiel": (56, 89),
+    "music box": (60, 84),
+    "vibraphone": (45, 89),
+    "marimba": (45, 89),
+    "xylophone": (56, 89),
+    "tubular bells": (54, 78),
+    "dulcimer": (40, 80),
+    "drawbar organ": (36, 96),
+    "percussive organ": (36, 96),
+    "rock organ": (36, 96),
+    "church organ": (36, 96),
+    "organ": (36, 96),
+    "reed organ": (36, 96),
+    "accordion": (45, 89),
+    "harmonica": (45, 89),
+    "tango accordion": (45, 89),
+    "acoustic guitar (nylon)": (40, 84),
+    "acoustic guitar (steel)": (40, 84),
+    "electric guitar": (40, 84),
+    "violin": (55, 100),
+    "viola": (48, 88),
+    "cello": (36, 76),
+    "contrabass": (28, 55),
+    "double bass": (28, 55),
+    "tremolo strings": (40, 96),
+    "pizzicato strings": (40, 96),
+    "orchestral harp": (24, 100),
+    "harp": (24, 100),
+    "timpani": (36, 57),
+    "string ensemble": (36, 96),
+    "synth strings": (36, 96),
+    "choir aahs": (36, 84),
+    "choir": (36, 84),
+    "chorus": (36, 84),
+    "voice oohs": (36, 84),
+    "voice": (36, 84),
+    "trumpet": (55, 88),
+    "trombone": (34, 72),
+    "tuba": (18, 55),
+    "french horn": (29, 77),
+    "horn": (29, 77),
+    "soprano sax": (50, 86),
+    "alto sax": (43, 79),
+    "tenor sax": (38, 74),
+    "baritone sax": (31, 67),
+    "oboe": (58, 91),
+    "english horn": (50, 81),
+    "bassoon": (26, 67),
+    "clarinet": (50, 94),
+    "piccolo": (74, 108),
+    "flute": (60, 96),
+    "recorder": (60, 96),
+    "pan flute": (60, 96),
+    "blown bottle": (60, 96),
+    "shakuhachi": (50, 80),
+    "whistle": (60, 96),
+    "ocarina": (60, 96),
+    "synth lead": (36, 96),
+    "synth pad": (36, 96),
+    "banjo": (48, 84),
+    "shamisen": (48, 84),
+    "koto": (48, 84),
+    "kalimba": (48, 84),
+    "bagpipe": (48, 84),
+    "fiddle": (55, 100),
+    "shana": (48, 84),
+}
+
 def get_program_number(name):
     """Maps a string instrument name to a General MIDI program number."""
     name_clean = name.strip().lower()
@@ -101,67 +194,138 @@ def get_program_number(name):
             
     return None
 
-def load_instrument_file(file_path):
-    """
-    Reads a list of instruments from a file, maps them to MIDI program numbers,
-    and returns a list of valid program numbers (max 5).
-    """
-    if not os.path.exists(file_path):
-        return []
-        
-    print(f"Reading instrument request file from {file_path}...")
-    valid_programs = []
+def python_array_split(lst, n):
+    """Splits a list into n approximately equal parts, preserving order."""
+    k, m = divmod(len(lst), n)
+    return [lst[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(n)]
+
+def fit_track_to_range(track, min_pitch, max_pitch):
+    """Shifts the entire track by octaves to fit within the instrument range."""
+    if len(track.notes) == 0:
+        return
+    pitches = [n.pitch for n in track.notes]
+    avg_pitch = sum(pitches) / len(pitches)
     
+    target_center = (min_pitch + max_pitch) / 2
+    
+    # Find the octave shift closest to the center of instrument range
+    best_shift = 0
+    min_dist = float('inf')
+    for shift in [-36, -24, -12, 0, 12, 24, 36]:
+        dist = abs((avg_pitch + shift) - target_center)
+        if dist < min_dist:
+            min_dist = dist
+            best_shift = shift
+            
+    if best_shift != 0:
+        print(f"  Track '{track.name}': Shifting pitches by {best_shift} semitones (octaves) to fit range [{min_pitch}, {max_pitch}]")
+        for n in track.notes:
+            n.pitch = max(min_pitch, min(max_pitch, n.pitch + best_shift))
+    else:
+        # Fallback clipping
+        for n in track.notes:
+            n.pitch = max(min_pitch, min(max_pitch, n.pitch))
+
+def parse_key_string(key_str):
+    """Parses a user input key string (e.g. 'G maj', 'F min') into a music21.key.Key object."""
+    clean = key_str.strip().lower()
+    
+    # Extract tonic note
+    match = re.match(r"^([a-g][#\-b]*)", clean)
+    if not match:
+        raise ValueError(f"Could not parse tonic note from key string: {key_str}")
+        
+    tonic = match.group(1)
+    
+    # Determine mode
+    is_minor = False
+    if "min" in clean or "minor" in clean or clean.endswith("m"):
+        is_minor = True
+        
+    # Standardize flat accidental notation
+    if len(tonic) > 1:
+        tonic = tonic[0] + tonic[1:].replace('b', '-')
+        
+    if is_minor:
+        return music21.key.Key(tonic.lower())
+    else:
+        return music21.key.Key(tonic.upper())
+
+def transpose_to_target_key(midi_path, xml_path, target_key_str):
+    """Detects the key of the generated score and transposes it to the target key."""
+    if not target_key_str:
+        return
+        
+    print(f"Detecting key of the generated music...")
+    try:
+        score = music21.converter.parse(midi_path)
+        detected_key = score.analyze('key')
+        print(f"  Detected key: {detected_key.name} (confidence: {detected_key.correlationCoefficient:.2f})")
+        
+        target_key = parse_key_string(target_key_str)
+        print(f"  Target key: {target_key.name}")
+        
+        interval = music21.interval.Interval(detected_key.tonic, target_key.tonic)
+        semitones = interval.semitones
+        
+        if semitones != 0:
+            print(f"  Transposing score by {semitones} semitones ({detected_key.tonic.name} -> {target_key.tonic.name})...")
+            transposed_score = score.transpose(interval)
+            transposed_score.write('midi', fp=midi_path)
+            transposed_score.write('musicxml', fp=xml_path)
+            print(f"  Saved transposed MIDI and MusicXML.")
+        else:
+            print("  Score is already in the target key. No transposition needed.")
+    except Exception as e:
+        print(f"  Warning: Key transposition failed: {e}")
+
+def load_input_json(file_path):
+    """Loads input configuration (instruments, tempo, key) from a JSON file."""
+    default_inputs = {
+        "instruments": [],
+        "tempo": None,
+        "key": None
+    }
+    
+    if not os.path.exists(file_path):
+        return default_inputs
+        
+    print(f"Reading input configuration from {file_path}...")
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
+            data = json.load(f)
             
-        for line in lines:
-            if len(valid_programs) >= 5:
-                print(f"Warning: Maximum limit of 5 instruments reached. Skipping '{line}'.")
-                continue
-                
-            prog = get_program_number(line)
-            if prog is not None:
-                valid_programs.append(prog)
-                print(f"  Mapped '{line}' -> MIDI Program {prog}")
-            else:
-                print(f"  Warning: Unrecognized instrument '{line}'. Skipping.")
+        inputs = {
+            "instruments": data.get("instruments", []),
+            "tempo": data.get("tempo", None),
+            "key": data.get("key", None)
+        }
+        return inputs
     except Exception as e:
-        print(f"Failed to read instrument file: {e}")
-        
-    return valid_programs
+        print(f"Failed to read input JSON file: {e}")
+        return default_inputs
 
-def generate_music(model_path, tokenizer, generate_config, output_midi_path, output_xml_path, program_ids=None):
+def generate_music(model_path, tokenizer, generate_config, output_midi_path, output_xml_path, user_inputs=None):
     """
-    Loads a trained model, generates a sequence of tokens on the active device (GPU if available),
-    decodes them to MIDI, and exports MIDI and MusicXML files.
+    Loads a trained model, generates a sequence of tokens, decodes them to MIDI,
+    and applies custom layouts (keyboard hands), tempo, pitch constraints, and transposition.
     """
     print(f"Loading trained model from {model_path}...")
     model = GPT2LMHeadModel.from_pretrained(model_path)
     model.eval()
     
-    # Auto-detect CUDA GPU or CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using inference device: {device.type.upper()}")
     model.to(device)
     
-    # Get special token IDs
     bos_token_id = tokenizer["BOS_None"] if "BOS_None" in tokenizer else None
     eos_token_id = tokenizer["EOS_None"] if "EOS_None" in tokenizer else None
     pad_token_id = tokenizer["PAD_None"] if "PAD_None" in tokenizer else tokenizer.pad_token_id
     
-    # Initialize input with BOS token
-    prompt_tokens = []
-    if bos_token_id is not None:
-        prompt_tokens.append(bos_token_id)
-    else:
-        prompt_tokens.append(0)
-                
+    prompt_tokens = [bos_token_id] if bos_token_id is not None else [0]
     input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
         
     print("Generating music tokens from model...")
-    # Force a longer minimum length to maximize output without exceeding 512 limit
     min_length = max(256, generate_config["max_length"] - 64)
     with torch.no_grad():
         generation_output = model.generate(
@@ -172,67 +336,108 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
             temperature=generate_config["temperature"],
             top_p=generate_config["top_p"],
             top_k=generate_config.get("top_k", 30),
-            repetition_penalty=generate_config.get("repetition_penalty", 1.15),
+            repetition_penalty=generate_config.get("repetition_penalty", 1.0),
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
         )
         
-    # Extract token list and move back to CPU for decoding
     generated_tokens = generation_output[0].cpu().tolist()
     print(f"Generated raw sequence of {len(generated_tokens)} tokens.")
     
-    # Decompose BPE tokens into base tokens before checking for bar boundaries
     seq = TokSequence(ids=generated_tokens)
     seq.are_ids_encoded = True
     tokenizer.decode_token_ids(seq)
     
-    # Truncate at the last completed Bar token to prevent incomplete measures and hanging notes
     bar_token_id = tokenizer["Bar_None"] if "Bar_None" in tokenizer else None
     if bar_token_id is not None and bar_token_id in seq.ids:
-        # Find index of last Bar token in base tokens
         last_bar_idx = len(seq.ids) - 1 - seq.ids[::-1].index(bar_token_id)
-        # Keep tokens up to and including the bar boundary
         seq.ids = seq.ids[:last_bar_idx + 1]
         print(f"Cleaned end of sequence. Truncated at last bar boundary. New length: {len(seq.ids)} base tokens.")
     
-    # Decode tokens back into a MIDI/Score object
     print("Decoding tokens back to MIDI...")
     try:
         decoded_midi = tokenizer(seq)
         
-        # Enforce a single stable tempo (clear chaotic tempo changes from under-trained model)
+        # Enforce inputs
+        instruments = user_inputs.get("instruments", []) if user_inputs else []
+        tempo = user_inputs.get("tempo", None) if user_inputs else None
+        
+        # Enforce constant tempo
         if hasattr(decoded_midi, "tempos"):
             initial_qpm = 120.0
-            if len(decoded_midi.tempos) > 0:
+            if tempo:
+                initial_qpm = float(tempo)
+            elif len(decoded_midi.tempos) > 0:
                 initial_qpm = decoded_midi.tempos[0].qpm
-            
-            decoded_midi.tempos.clear()
-            import symusic
-            decoded_midi.tempos.append(symusic.Tempo(0, initial_qpm))
-            print(f"Cleaned tempo changes. Enforced a stable constant tempo of {initial_qpm:.2f} BPM.")
-            
-        # Re-map tracks to requested instruments, cycling through them if there are more tracks than instruments
-        if program_ids and hasattr(decoded_midi, "tracks"):
-            print(f"Applying custom instrument re-mapping for tracks: {program_ids}")
-            for i, track in enumerate(decoded_midi.tracks):
-                old_prog = track.program
-                # Cycle through the requested instruments
-                new_prog = program_ids[i % len(program_ids)]
-                track.program = new_prog
                 
-                # Set a descriptive track name based on program number
-                names = [k for k, v in INSTRUMENT_TO_PROGRAM.items() if v == new_prog]
-                track.name = names[0].title() if names else f"Voice {i+1}"
-                print(f"  Track {i}: Remapped Program {old_prog} -> Program {new_prog} ({track.name})")
+            decoded_midi.tempos.clear()
+            decoded_midi.tempos.append(symusic.Tempo(0, initial_qpm))
+            print(f"Enforced stable constant tempo of {initial_qpm:.2f} BPM.")
+            
+        # Parse slots for instruments, accounting for 2 hands on keyboards
+        if not instruments:
+            instruments = ["piano"]
+            
+        slots = []
+        for inst_name in instruments:
+            prog = get_program_number(inst_name)
+            if prog is None:
+                print(f"Warning: Unrecognized instrument '{inst_name}'. Defaulting to Piano.")
+                prog = 0
+                inst_name = "piano"
+                
+            is_keyboard = inst_name.strip().lower() in KEYBOARD_INSTRUMENTS
+            if is_keyboard:
+                slots.append({"name": inst_name, "program": prog, "hand": "right"})
+                slots.append({"name": inst_name, "program": prog, "hand": "left"})
+            else:
+                slots.append({"name": inst_name, "program": prog, "hand": "solo"})
+                
+        num_tracks = len(decoded_midi.tracks)
+        num_slots = len(slots)
+        print(f"Applying custom instrument re-mapping. Distributing {num_tracks} tracks into {num_slots} slots...")
+        
+        new_tracks = []
+        
+        if num_slots >= num_tracks:
+            # Map each track to a slot. Cycle slots if there are fewer tracks than slots.
+            for idx in range(num_tracks):
+                slot = slots[idx]
+                track = decoded_midi.tracks[idx]
+                track.program = slot["program"]
+                track.name = f"{slot['name'].title()} ({slot['hand'].upper()})" if slot["hand"] != "solo" else slot["name"].title()
+                
+                min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
+                fit_track_to_range(track, min_p, max_p)
+                new_tracks.append(track)
+        else:
+            # Map more tracks than slots: group and merge tracks into slots
+            indices_split = python_array_split(range(num_tracks), num_slots)
+            for slot_idx, slot in enumerate(slots):
+                group_indices = indices_split[slot_idx]
+                print(f"  Slot '{slot['name']} ({slot['hand']})' merged from tracks: {group_indices}")
+                
+                merged_track = symusic.Track(
+                    program=slot["program"],
+                    name=f"{slot['name'].title()} ({slot['hand'].upper()})" if slot["hand"] != "solo" else slot["name"].title()
+                )
+                for t_idx in group_indices:
+                    orig_track = decoded_midi.tracks[t_idx]
+                    for note in orig_track.notes:
+                        merged_track.notes.append(note)
+                        
+                min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
+                fit_track_to_range(merged_track, min_p, max_p)
+                new_tracks.append(merged_track)
+                
+        decoded_midi.tracks = new_tracks
         
         # Save MIDI file
         os.makedirs(os.path.dirname(output_midi_path), exist_ok=True)
         if hasattr(decoded_midi, "dump_midi"):
             decoded_midi.dump_midi(output_midi_path)
-        elif hasattr(decoded_midi, "write"):
-            decoded_midi.write(output_midi_path)
         else:
-            decoded_midi.dump(output_midi_path)
+            decoded_midi.write(output_midi_path)
             
         print(f"Saved generated MIDI to {output_midi_path}")
     except Exception as e:
@@ -247,7 +452,10 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         print(f"Saved sheet music to {output_xml_path}")
     except Exception as e:
         print(f"Failed to convert MIDI to MusicXML: {e}")
-        print("Note: This is common if the generated MIDI contains empty tracks. The MIDI file is still fully functional.")
+        
+    # Transpose to target key signature
+    if user_inputs and user_inputs.get("key"):
+        transpose_to_target_key(output_midi_path, output_xml_path, user_inputs["key"])
 
 if __name__ == "__main__":
     from src.config import CHECKPOINT_DIR, GENERATE_CONFIG, OUTPUT_DIR, BASE_DIR
@@ -260,10 +468,10 @@ if __name__ == "__main__":
         out_mid = os.path.join(OUTPUT_DIR, "generated_bach.mid")
         out_xml = os.path.join(OUTPUT_DIR, "generated_bach.xml")
         
-        # Check for instruments request file in the project base directory
-        inst_file = os.path.join(BASE_DIR, "instruments.txt")
-        program_ids = load_instrument_file(inst_file)
+        # Load inputs from JSON configuration file
+        input_file = os.path.join(BASE_DIR, "input.json")
+        user_inputs = load_input_json(input_file)
         
-        generate_music(model_path, tokenizer, GENERATE_CONFIG, out_mid, out_xml, program_ids=program_ids)
+        generate_music(model_path, tokenizer, GENERATE_CONFIG, out_mid, out_xml, user_inputs=user_inputs)
     else:
         print(f"Model path {model_path} does not exist. Please train the model first.")
