@@ -365,7 +365,7 @@ def build_control_prefix_tokens(user_inputs):
     
     instruments = user_inputs.get("instruments", ["piano"])
     num_staves = count_total_staves(instruments)
-    voices_map = {1: "V2", 2: "V2", 3: "V3", 4: "V4", 5: "V5", 6: "V6", 7: "V6", 8: "V8", 9: "V8", 10: "V10"}
+    voices_map = {1: "V2", 2: "V2", 3: "V3", 4: "V4", 5: "V5", 6: "V6", 7: "V7", 8: "V8", 9: "V9", 10: "V10"}
     voices_token = voices_map.get(num_staves, "V4")
     if num_staves > 10:
         voices_token = "V10"
@@ -962,17 +962,48 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         print(f"Failed to convert MIDI to MusicXML: {e}")
 
 if __name__ == "__main__":
+    import argparse
     from src.config import CHECKPOINT_DIR, GENERATE_CONFIG, OUTPUT_DIR, BASE_DIR
     from src.tokenizer import get_tokenizer
     
-    tokenizer = get_tokenizer()
-    model_path = os.path.join(CHECKPOINT_DIR, "best_model")
+    parser = argparse.ArgumentParser(description="J.S. Bach Music Generation CLI")
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=os.path.join(CHECKPOINT_DIR, "best_model"),
+        help="Path to the trained model directory."
+    )
+    parser.add_argument(
+        "--output_midi",
+        type=str,
+        default=os.path.join(OUTPUT_DIR, "generated_bach.mid"),
+        help="Path to output the generated MIDI file."
+    )
+    parser.add_argument(
+        "--output_xml",
+        type=str,
+        default=os.path.join(OUTPUT_DIR, "generated_bach.xml"),
+        help="Path to output the generated MusicXML sheet music."
+    )
+    parser.add_argument(
+        "--input_json",
+        type=str,
+        default=os.path.join(BASE_DIR, "input.json"),
+        help="Path to the input JSON control file."
+    )
+    args = parser.parse_args()
     
-    if os.path.exists(model_path):
-        out_mid = os.path.join(OUTPUT_DIR, "generated_bach.mid")
-        out_xml = os.path.join(OUTPUT_DIR, "generated_bach.xml")
-        input_file = os.path.join(BASE_DIR, "input.json")
-        user_inputs = load_input_json(input_file)
-        generate_music(model_path, tokenizer, GENERATE_CONFIG, out_mid, out_xml, user_inputs=user_inputs)
+    tokenizer = get_tokenizer()
+    
+    if os.path.exists(args.model_path):
+        user_inputs = load_input_json(args.input_json)
+        generate_music(
+            model_path=args.model_path,
+            tokenizer=tokenizer,
+            generate_config=GENERATE_CONFIG,
+            output_midi_path=args.output_midi,
+            output_xml_path=args.output_xml,
+            user_inputs=user_inputs
+        )
     else:
-        print(f"Model path {model_path} does not exist. Please train the model first.")
+        print(f"Model path {args.model_path} does not exist. Please check the path or train the model first.")
