@@ -5,11 +5,12 @@ from torch.amp import autocast, GradScaler
 from transformers import get_cosine_schedule_with_warmup
 from tqdm import tqdm
 
-def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, start_epoch=1):
+def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, start_epoch=1, hf_repo=None, hf_token=None):
     """
     Standard PyTorch training loop with CUDA GPU support, gradient accumulation,
     mixed precision training (AMP), gradient checkpointing, and cosine scheduler.
     Saves and restores full training state for multi-session checkpointing.
+    Uploads checkpoints dynamically to Hugging Face Hub if hf_repo is active.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting training. Using device: {device.type.upper()}")
@@ -155,6 +156,46 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
             "best_val_loss": best_val_loss
         }, state_path)
         print(f"Saved training state to {state_path}")
+        
+        # --- HUGGING FACE SYNC ---
+        if hf_repo:
+            print(f"Syncing checkpoints with Hugging Face Hub ({hf_repo})...")
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=hf_token)
+                api.create_repo(repo_id=hf_repo, private=True, exist_ok=True)
+                
+                # Upload current epoch checkpoint
+                api.upload_folder(
+                    folder_path=epoch_path,
+                    path_in_repo=f"epoch_{epoch}",
+                    repo_id=hf_repo
+                )
+                
+                # Upload best model if updated
+                if compare_loss < best_val_loss:
+                    api.upload_folder(
+                        folder_path=best_model_path,
+                        path_in_repo="best_model",
+                        repo_id=hf_repo
+                    )
+                
+                # Upload training state & tokenizer
+                api.upload_file(
+                    path_or_fileobj=state_path,
+                    path_in_repo="training_state.pt",
+                    repo_id=hf_repo
+                )
+                from src.config import TOKENIZER_PATH
+                if os.path.exists(TOKENIZER_PATH):
+                    api.upload_file(
+                        path_or_fileobj=TOKENIZER_PATH,
+                        path_in_repo="tokenizer.json",
+                        repo_id=hf_repo
+                    )
+                print(f"--> Successfully synchronized Epoch {epoch} checkpoints with Hugging Face Hub.")
+            except Exception as e:
+                print(f"  Warning: Hugging Face sync failed: {e}")
         
     print("Training finished successfully!")
 

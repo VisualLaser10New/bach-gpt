@@ -29,6 +29,18 @@ def main():
         action="store_true",
         help="Delete all existing checkpoints and tokenizer to start a clean run from epoch 1."
     )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=os.environ.get("HF_REPO", None),
+        help="Hugging Face repository name (e.g., 'username/bach-llama') for checkpoint syncing."
+    )
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=os.environ.get("HF_TOKEN", None),
+        help="Hugging Face access token with WRITE permissions."
+    )
     args = parser.parse_args()
     
     # Define model and training configs (which can be overridden in dry-run)
@@ -76,6 +88,34 @@ def main():
             "max_length": 64,
         })
         
+    # Hugging Face Checkpoint Syncing (Download phase)
+    if args.hf_repo and not args.reset and not args.dry_run:
+        print(f"Hugging Face sync active. Checking repository '{args.hf_repo}' for existing checkpoints...")
+        try:
+            from huggingface_hub import snapshot_download, HfApi
+            api = HfApi(token=args.hf_token)
+            if api.repo_exists(repo_id=args.hf_repo, repo_type="model"):
+                print(f"  Downloading existing checkpoints from Hugging Face Hub...")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                snapshot_download(
+                    repo_id=args.hf_repo,
+                    local_dir=checkpoint_dir,
+                    token=args.hf_token,
+                    ignore_patterns=["*.git*", "README.md", ".gitattributes"]
+                )
+                print(f"  Checkpoints downloaded successfully.")
+                
+                # Copy tokenizer.json if present
+                local_tokenizer_in_checkpoints = os.path.join(checkpoint_dir, "tokenizer.json")
+                if os.path.exists(local_tokenizer_in_checkpoints):
+                    import shutil
+                    shutil.copy(local_tokenizer_in_checkpoints, TOKENIZER_PATH)
+                    print(f"  Copied tokenizer.json from checkpoints to workspace root.")
+            else:
+                print(f"  Repository '{args.hf_repo}' does not exist yet. Will create it on the first save.")
+        except Exception as e:
+            print(f"  Warning: Could not sync from Hugging Face Hub: {e}")
+
     # Detect checkpoint epoch early to know if we are starting a fresh run
     start_epoch = 1
     latest_epoch_path = None
@@ -188,7 +228,9 @@ def main():
             val_loader=val_loader,
             train_config=train_config,
             checkpoint_dir=checkpoint_dir,
-            start_epoch=start_epoch
+            start_epoch=start_epoch,
+            hf_repo=args.hf_repo,
+            hf_token=args.hf_token
         )
     
     # Phase 6: Output Generation
