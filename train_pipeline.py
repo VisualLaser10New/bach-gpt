@@ -249,7 +249,10 @@ def main():
         print("No existing checkpoints found. Initializing new model weights...")
         model = get_model(tokenizer, model_config)
 
-        
+    # Enable gradient checkpointing to drastically reduce activation memory for 4096 context length
+    if not args.dry_run:
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled to prevent CUDA Out-Of-Memory errors.")
     # Save the initialized model configuration/weights so inference script can load it
     best_model_path = os.path.join(checkpoint_dir, "best_model")
     if start_epoch == 1:
