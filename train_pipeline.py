@@ -12,6 +12,17 @@ from src.model import get_model
 from src.train import train_model
 from src.generate import generate_music
 
+def sanitize_hf_repo(repo_str):
+    if not repo_str:
+        return repo_str
+    # Remove protocol and domain if present
+    clean = repo_str.strip()
+    if "huggingface.co/" in clean:
+        clean = clean.split("huggingface.co/")[-1]
+    # Strip leading/trailing slashes
+    clean = clean.strip("/")
+    return clean
+
 def main():
     parser = argparse.ArgumentParser(description="J.S. Bach Polyphonic Sheet Music Generator Pipeline")
     parser.add_argument(
@@ -42,6 +53,9 @@ def main():
         help="Hugging Face access token with WRITE permissions."
     )
     args = parser.parse_args()
+    
+    if args.hf_repo:
+        args.hf_repo = sanitize_hf_repo(args.hf_repo)
     
     # Define model and training configs (which can be overridden in dry-run)
     model_config = MODEL_CONFIG.copy()
