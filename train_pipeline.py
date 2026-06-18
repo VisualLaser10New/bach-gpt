@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import torch.distributed as dist
 from src.config import (
     DATASET_DIR, PROCESSED_DIR, CHECKPOINT_DIR, OUTPUT_DIR,
     MODEL_CONFIG, TRAIN_CONFIG, GENERATE_CONFIG, TOKENIZER_PATH
@@ -8,7 +9,7 @@ from src.config import (
 from src.data_prep import prepare_dataset, get_midi_files
 from src.tokenizer import get_tokenizer
 from src.dataset import prepare_dataset_loaders
-from src.model import get_model
+from src.model import get_model, BachLlamaForCausalLM
 from src.train import train_model
 from src.generate import generate_music
 
@@ -56,6 +57,13 @@ def main():
     
     if args.hf_repo:
         args.hf_repo = sanitize_hf_repo(args.hf_repo)
+    
+    # Detect DDP context
+    is_ddp = "LOCAL_RANK" in os.environ
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if args.dry_run:
+        os.environ["DRY_RUN"] = "1"
     
     # Define model and training configs (which can be overridden in dry-run)
     model_config = MODEL_CONFIG.copy()
@@ -144,11 +152,29 @@ def main():
                 epoch_dirs.append((epoch_num, os.path.join(checkpoint_dir, name)))
         
         if epoch_dirs:
-            # Sort by epoch number to get the latest
-            epoch_dirs.sort(key=lambda x: x[0])
-            latest_epoch, latest_epoch_path = epoch_dirs[-1]
-            start_epoch = latest_epoch + 1
-            
+            # If a training_state.pt exists, resume from the latest epoch (train.py will restore state).
+            # Otherwise, prefer best_model so the latest best checkpoint is used rather than the last epoch.
+            state_path = os.path.join(checkpoint_dir, "training_state.pt")
+            if os.path.exists(state_path):
+                epoch_dirs.sort(key=lambda x: x[0])
+                latest_epoch, latest_epoch_path = epoch_dirs[-1]
+                start_epoch = latest_epoch + 1
+            else:
+                best_model_path = os.path.join(checkpoint_dir, "best_model")
+                if os.path.exists(best_model_path):
+                    print(f"Warning: training_state.pt not found. Resuming from best_model instead of latest epoch.")
+                    latest_epoch_path = best_model_path
+                    # Determine start epoch from best_model/config.json if possible, else latest epoch
+                    start_epoch = 1
+                    for num, path in epoch_dirs:
+                        if os.path.samefile(path, best_model_path):
+                            continue
+                        start_epoch = max(start_epoch, num + 1)
+                else:
+                    epoch_dirs.sort(key=lambda x: x[0])
+                    latest_epoch, latest_epoch_path = epoch_dirs[-1]
+                    start_epoch = latest_epoch + 1
+                    
     # Phase 1: Data Preparation & Augmentation
     print("--- Phase 1: Preparing and Augmenting Dataset ---")
     semitones_list = train_config.get("transposition_keys", [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5])
@@ -194,7 +220,9 @@ def main():
         tokenizer=tokenizer,
         max_seq_len=model_config["n_positions"],
         batch_size=train_config["batch_size"],
-        val_split=0.2 if not args.dry_run else 0.0 # No val split for tiny dry-run
+        val_split=0.2 if not args.dry_run else 0.0, # No val split for tiny dry-run
+        rank=rank,
+        world_size=world_size
     )
     
     # Phase 4: Model Instantiation / Resume Check
@@ -204,7 +232,6 @@ def main():
         # Add check to verify architecture mismatch
         config_file_path = os.path.join(latest_epoch_path, "config.json")
         if os.path.exists(config_file_path):
-            import json
             try:
                 with open(config_file_path, "r", encoding="utf-8") as f:
                     cfg_data = json.load(f)
@@ -217,8 +244,7 @@ def main():
                     sys.exit(1)
             except Exception:
                 pass
-        from transformers import LlamaForCausalLM
-        model = LlamaForCausalLM.from_pretrained(latest_epoch_path)
+        model = BachLlamaForCausalLM.from_pretrained(latest_epoch_path)
     else:
         print("No existing checkpoints found. Initializing new model weights...")
         model = get_model(tokenizer, model_config)

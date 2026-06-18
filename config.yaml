@@ -35,21 +35,24 @@ model:
 
 # Training Configuration (Optimized for T4 VRAM)
 training:
-  batch_size: 4                     # Actual GPU micro-batch
-  gradient_accumulation_steps: 8    # Effective batch = 32
+  batch_size: 8                     # Actual GPU micro-batch
+  gradient_accumulation_steps: 4    # Effective batch = 32
   learning_rate: 0.0003             # Learning rate for cosine scheduler
-  num_epochs: 20                    # Number of epochs
-  weight_decay: 0.01                # Regularization
+  num_epochs: 12                    # Number of epochs with early stopping
+  early_stopping_patience: 4          # Stop if val loss doesn't improve for N epochs
+  weight_decay: 0.05                # Regularization
   save_steps: 500                   # Save checkpoint every N steps
   logging_steps: 50                 # Log every N steps
   seed: 42
-  transposition_keys: [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6]  # 12 keys (full chromatic)
+  transposition_keys: [-2, 0, 2, -3, 5]  # 5 keys spanning the circle of fifths
 
 # Inference Configuration
 generate:
   max_length: 4096                  # Max tokens to generate
-  temperature: 0.72                 # Slightly lower for structural cohesion
-  top_p: 0.92                       # Nucleus sampling threshold
-  top_k: 30                         # Filter out low-probability tokens
-  repetition_penalty: 1.0           # Repetition penalty (1.0 = none)
+  temperature: 0.95                 # Higher sampling temperature for more varied output
+  top_p: 0.9                        # Nucleus sampling threshold
+  top_k: 40                         # Filter out low-probability tokens
+  repetition_penalty: 1.15          # Repetition penalty to break note loops
+  no_repeat_ngram_size: 8           # Block exact 8-gram repeats
+  time_signature: "4/4"             # Default time signature for generation / ABA merge
 

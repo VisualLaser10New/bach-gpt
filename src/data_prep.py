@@ -42,11 +42,37 @@ def download_builtin_bach_corpus(target_dir):
             
     print(f"Successfully extracted {success_count} Bach files to {target_dir}")
 
+def sort_tracks_by_pitch(score):
+    """
+    Sort tracks by average pitch descending (highest first). Empty tracks sort last.
+    Skips drum tracks entirely (program 128 or is_drum flag).
+    """
+    def is_drum(track):
+        if getattr(track, "is_drum", False):
+            return True
+        if getattr(track, "program", 0) == 128:
+            return True
+        if getattr(track, "channel", -1) == 9:
+            return True
+        return False
+
+    def avg_pitch(track):
+        notes = [n for n in track.notes if getattr(n, "pitch", 0) > 0]
+        if len(notes) == 0:
+            return -1
+        return sum(n.pitch for n in notes) / len(notes)
+
+    filtered = [t for t in score.tracks if not is_drum(t)]
+    filtered.sort(key=avg_pitch, reverse=True)
+    score.tracks = filtered
+    return score
+
 def transpose_midi(midi_path, output_dir, semitones_list=None):
     """
     Transpose a MIDI file into specified keys
     and save them to output_dir using symusic (extremely fast C++ parser).
-    Also assigns a unique program number to each track to preserve voice identity.
+    Sorts tracks by average pitch (highest first) and assigns a unique program number
+    to each track to preserve consistent register->voice identity.
     Saves a metadata sidecar json mapping control tokens for the piece.
     """
     if semitones_list is None:
@@ -54,7 +80,8 @@ def transpose_midi(midi_path, output_dir, semitones_list=None):
     try:
         score = symusic.Score(midi_path)
         
-        # Assign unique program numbers to each track to preserve voice identity during tokenization
+        # Sort tracks by average pitch (descending), skip drums, then assign program indices
+        sort_tracks_by_pitch(score)
         for idx, track in enumerate(score.tracks):
             track.program = idx
             

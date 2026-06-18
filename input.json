@@ -10,5 +10,6 @@
   "genre": "concerto",
   "density": "moderate",
   "baroque_tag": "prelude",
-  "form": "ABA"
+  "form": "ABA",
+  "time_signature": "4/4"
 }

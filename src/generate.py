@@ -189,7 +189,7 @@ class VoiceBalanceProcessor(LogitsProcessor):
     If a voice is silent for more than N bars, progressively boost its 
     Program_X token logit to force re-entry.
     """
-    def __init__(self, tokenizer, max_silent_bars=4):
+    def __init__(self, tokenizer, max_silent_bars=2):
         self.program_tokens = {}
         for i in range(16):  # General MIDI supports up to 16 channels
             token_name = f"Program_{i}"
@@ -239,11 +239,77 @@ class VoiceBalanceProcessor(LogitsProcessor):
         for prog_idx, token_id in self.program_tokens.items():
             bars_silent = self.current_bar - self.last_active_bar[prog_idx]
             if bars_silent > self.max_silent_bars:
-                # Gradual boost: +1.0 per bar of silence beyond threshold
-                boost = min((bars_silent - self.max_silent_bars) * 1.0, 5.0)
+                # Gradual boost: +1.0 per bar of silence beyond threshold, capped at 3.0
+                boost = min((bars_silent - self.max_silent_bars) * 1.0, 3.0)
                 scores[0, token_id] += boost
         
         return scores
+
+class ChordGuardProcessor(LogitsProcessor):
+    """
+    Counts Pitch tokens within a single Position. If 6+ Pitch tokens are emitted at the same position
+    (which would create a mutant chord), aggressively boost the next Position/Bar/Rest token so the model
+    moves forward in time instead of stacking more notes.
+    """
+    def __init__(self, tokenizer):
+        self.pitch_token_ids = set()
+        self.position_token_ids = set()
+        self.bar_token_id = tokenizer["Bar_None"] if "Bar_None" in tokenizer else None
+        rest_token_names = ["Rest_0.25", "Rest_0.5", "Rest_1.0", "Rest_2.0", "Rest_4.0", "Rest_8.0"]
+        self.advance_token_ids = set()
+        if self.bar_token_id is not None:
+            self.advance_token_ids.add(self.bar_token_id)
+        for name in rest_token_names:
+            if name in tokenizer.vocab:
+                self.advance_token_ids.add(tokenizer[name])
+        for name, tid in tokenizer.vocab.items():
+            if name.startswith("Pitch_"):
+                self.pitch_token_ids.add(tid)
+            elif name.startswith("Position_"):
+                self.position_token_ids.add(tid)
+        self.position_pitch_count = 0
+        self.boost = 4.0
+        self.threshold = 6
+
+    def __call__(self, input_ids, scores):
+        last_token = input_ids[0, -1].item()
+        if last_token in self.position_token_ids or last_token == self.bar_token_id:
+            self.position_pitch_count = 0
+        elif last_token in self.pitch_token_ids:
+            self.position_pitch_count += 1
+
+        if self.position_pitch_count >= self.threshold:
+            for tid in self.advance_token_ids:
+                scores[0, tid] += self.boost
+            for tid in self.position_token_ids:
+                scores[0, tid] += self.boost
+        return scores
+
+def filter_degenerate_chords(score, max_notes=4):
+    """
+    Post-decode safety net: any chord with >max_notes notes or duplicate pitch-classes at a single tick
+    keeps only the highest-pitch notes (up to max_notes).
+    """
+    for track in score.tracks:
+        groups = {}
+        for n in track.notes:
+            groups.setdefault(n.time, []).append(n)
+        to_remove = []
+        for time_val, notes in groups.items():
+            if len(notes) > max_notes or len(set(n.pitch % 12 for n in notes)) < len(notes):
+                # Keep highest note per pitch class, then cap at max_notes
+                pc_best = {}
+                for n in notes:
+                    pc = n.pitch % 12
+                    if pc not in pc_best or n.pitch > pc_best[pc].pitch:
+                        pc_best[pc] = n
+                keep = sorted(pc_best.values(), key=lambda n: n.pitch, reverse=True)[:max_notes]
+                keep_set = set(keep)
+                to_remove.extend([n for n in notes if n not in keep_set])
+        if to_remove:
+            remove_set = set(to_remove)
+            track.notes = [n for n in track.notes if n not in remove_set]
+    return score
 
 def get_program_number(name):
     """Maps a string instrument name to a General MIDI program number."""
@@ -329,7 +395,8 @@ def load_input_json(file_path):
         "genre": "keyboard",
         "density": "moderate",
         "baroque_tag": None,
-        "form": "ABA"
+        "form": "ABA",
+        "time_signature": "4/4"
     }
     if not os.path.exists(file_path):
         return default_inputs
@@ -387,6 +454,13 @@ def build_control_prefix_tokens(user_inputs):
         tempo_token = "TEMPO_MEDIUM"
     prefix.append(tempo_token)
     
+    # Add mode token based on requested key
+    key_str = user_inputs.get("key", "")
+    if key_str and ("min" in key_str.lower() or key_str.lower().endswith("m")):
+        prefix.append("MODE_MINOR")
+    else:
+        prefix.append("MODE_MAJOR")
+    
     baroque_tag = user_inputs.get("baroque_tag")
     if baroque_tag:
         tag_clean = baroque_tag.strip().upper()
@@ -430,11 +504,12 @@ def generate_section(model, tokenizer, prompt_ids, max_length, generate_config, 
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     voice_processor = VoiceBalanceProcessor(
         tokenizer=tokenizer,
-        max_silent_bars=generate_config.get("max_silent_bars", 4)
+        max_silent_bars=generate_config.get("max_silent_bars", 2)
     )
+    chord_guard = ChordGuardProcessor(tokenizer)
     
     from transformers import LogitsProcessorList
-    processors = LogitsProcessorList([voice_processor])
+    processors = LogitsProcessorList([voice_processor, chord_guard])
     
     prompt_len = len(prompt_ids)
     max_new_tokens = max(16, max_length - prompt_len)
@@ -451,23 +526,38 @@ def generate_section(model, tokenizer, prompt_ids, max_length, generate_config, 
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             do_sample=True,
-            temperature=generate_config.get("temperature", 0.72),
-            top_p=generate_config.get("top_p", 0.92),
-            top_k=generate_config.get("top_k", 30),
-            repetition_penalty=generate_config.get("repetition_penalty", 1.0),
+            temperature=generate_config.get("temperature", 0.95),
+            top_p=generate_config.get("top_p", 0.9),
+            top_k=generate_config.get("top_k", 40),
+            repetition_penalty=generate_config.get("repetition_penalty", 1.15),
+            no_repeat_ngram_size=generate_config.get("no_repeat_ngram_size", 8),
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             logits_processor=processors
         )
     return generation_output[0].cpu().tolist()
 
-def get_bar_aligned_ticks(score):
-    numerator, denominator = 4, 4
-    if len(score.time_signatures) > 0:
-        ts = score.time_signatures[0]
-        numerator, denominator = ts.numerator, ts.denominator
+def get_bar_aligned_ticks(score, time_signature="4/4"):
+    """
+    Returns a tick boundary aligned to full bars using a single, enforced time signature.
+    Strips any existing time signatures from the score and applies the requested one at tick 0.
+    """
+    # Parse time signature string
+    try:
+        num_str, den_str = time_signature.split("/")
+        numerator = int(num_str)
+        denominator = int(den_str)
+    except Exception:
+        numerator, denominator = 4, 4
+
+    # Strip all time signatures and apply a single one at tick 0
+    score.time_signatures.clear()
+    score.time_signatures.append(symusic.TimeSignature(0, numerator, denominator))
+
     ticks_per_beat = score.ticks_per_quarter * (4 / denominator)
     ticks_per_bar = int(numerator * ticks_per_beat)
+    if ticks_per_bar <= 0:
+        ticks_per_bar = score.ticks_per_quarter * 4
     num_bars = int(math.ceil(score.end() / ticks_per_bar))
     return num_bars * ticks_per_bar
 
@@ -538,18 +628,21 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     seq_ab.are_ids_encoded = True
     tokenizer.decode_token_ids(seq_ab)
     score_ab = tokenizer(seq_ab)
+    score_ab = filter_degenerate_chords(score_ab)
     
     print("Decoding Section A for Reprise...")
     seq_a = TokSequence(ids=notes_a)
     seq_a.are_ids_encoded = True
     tokenizer.decode_token_ids(seq_a)
     score_a = tokenizer(seq_a)
+    score_a = filter_degenerate_chords(score_a)
     
     print("Applying MIDI variations to create Section A'...")
     score_a_prime = apply_midi_variation(score_a)
     
     # Align and Merge
-    align_boundary = get_bar_aligned_ticks(score_ab)
+    time_signature = user_inputs.get("time_signature", generate_config.get("time_signature", "4/4"))
+    align_boundary = get_bar_aligned_ticks(score_ab, time_signature)
     
     # Re-tempo the reprise section to match Section A's initial tempo at the boundary
     if len(score_a.tempos) > 0:
@@ -735,7 +828,8 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
             "genre": "keyboard",
             "density": "moderate",
             "baroque_tag": None,
-            "form": "ABA"
+            "form": "ABA",
+            "time_signature": "4/4"
         }
     validate_inputs(user_inputs)
     
@@ -762,10 +856,11 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         
         voice_processor = VoiceBalanceProcessor(
             tokenizer=tokenizer,
-            max_silent_bars=generate_config.get("max_silent_bars", 4)
+            max_silent_bars=generate_config.get("max_silent_bars", 2)
         )
+        chord_guard = ChordGuardProcessor(tokenizer)
         from transformers import LogitsProcessorList
-        processors = LogitsProcessorList([voice_processor])
+        processors = LogitsProcessorList([voice_processor, chord_guard])
         
         prompt_len = len(prompt_tokens)
         max_new_tokens = max(16, generate_config["max_length"] - prompt_len)
@@ -777,10 +872,11 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
                 max_new_tokens=max_new_tokens,
                 min_new_tokens=min_new_tokens,
                 do_sample=True,
-                temperature=generate_config["temperature"],
-                top_p=generate_config["top_p"],
-                top_k=generate_config.get("top_k", 30),
-                repetition_penalty=generate_config.get("repetition_penalty", 1.0),
+                temperature=generate_config.get("temperature", 0.95),
+                top_p=generate_config.get("top_p", 0.9),
+                top_k=generate_config.get("top_k", 40),
+                repetition_penalty=generate_config.get("repetition_penalty", 1.15),
+                no_repeat_ngram_size=generate_config.get("no_repeat_ngram_size", 8),
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer["EOS_None"] if "EOS_None" in tokenizer else None,
                 logits_processor=processors
@@ -794,7 +890,7 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
         seq.are_ids_encoded = True
         tokenizer.decode_token_ids(seq)
         decoded_midi = tokenizer(seq)
-        
+        decoded_midi = filter_degenerate_chords(decoded_midi)
     # Enforce constant tempo in symusic Score
     if hasattr(decoded_midi, "tempos"):
         initial_qpm = 120.0
@@ -848,39 +944,45 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
     num_slots = len(slots)
     print(f"Applying custom instrument re-mapping. Distributing {num_tracks} tracks into {num_slots} slots...")
     
-    if num_slots != num_tracks:
-        print(f"  Warning: Track count mismatch! Requested {num_slots} instrument slots, but model generated {num_tracks} tracks.")
-        
-    new_tracks = []
-    if num_slots >= num_tracks:
-        for idx in range(num_slots):
-            slot = slots[idx]
-            if idx < num_tracks:
-                track = decoded_midi.tracks[idx]
-                track.program = slot["program"]
-                track.name = slot["track_name"]
-                min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
-                fit_track_to_range(track, min_p, max_p)
-                new_tracks.append(track)
-            else:
-                # Append an empty silent track for the missing slot (Bug #13) so it is still represented in the score
-                empty_track = symusic.Track(program=slot["program"], name=slot["track_name"])
-                new_tracks.append(empty_track)
-    else:
-        indices_split = python_array_split(range(num_tracks), num_slots)
-        for slot_idx, slot in enumerate(slots):
-            group_indices = indices_split[slot_idx]
-            print(f"  Slot '{slot['name']} ({slot['hand']})' merged from tracks: {group_indices}")
-            merged_track = symusic.Track(program=slot["program"], name=slot["track_name"])
-            for t_idx in group_indices:
-                orig_track = decoded_midi.tracks[t_idx]
-                for note in orig_track.notes:
-                    merged_track.notes.append(note)
+    # Sort generated tracks by average pitch descending so highest register maps to highest instrument
+    def get_avg_pitch(t):
+        if len(t.notes) == 0:
+            return -1
+        return sum(n.pitch for n in t.notes) / len(t.notes)
+
+    sorted_tracks = sorted(decoded_midi.tracks, key=get_avg_pitch, reverse=True)
+
+    # Sort requested slots by target pitch center descending (highest instrument first)
+    def slot_center(slot):
+        is_kb = slot["name"].strip().lower() in KEYBOARD_INSTRUMENTS
+        if is_kb:
+            return 60 if slot["hand"] == "right" else 48
+        min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
+        return (min_p + max_p) / 2
+
+    sorted_slots = sorted(slots, key=slot_center, reverse=True)
+
+    mapped_tracks = []
+    for idx, slot in enumerate(sorted_slots):
+        if idx < len(sorted_tracks):
+            track = sorted_tracks[idx]
+            track.program = slot["program"]
+            track.name = slot["track_name"]
             min_p, max_p = INSTRUMENT_RANGES.get(slot["name"], (21, 108))
-            fit_track_to_range(merged_track, min_p, max_p)
-            new_tracks.append(merged_track)
-            
-    decoded_midi.tracks = new_tracks
+            fit_track_to_range(track, min_p, max_p)
+            mapped_tracks.append(track)
+        else:
+            empty_track = symusic.Track(program=slot["program"], name=slot["track_name"])
+            mapped_tracks.append(empty_track)
+
+    # Handle any leftover tracks beyond the requested slots
+    leftover_tracks = sorted_tracks[len(sorted_slots):]
+    for track in leftover_tracks:
+        track.program = 0
+        track.name = "Unassigned"
+        mapped_tracks.append(track)
+
+    decoded_midi.tracks = mapped_tracks
     
     # Save MIDI file
     os.makedirs(os.path.dirname(output_midi_path), exist_ok=True)
@@ -961,6 +1063,51 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
     except Exception as e:
         print(f"Failed to convert MIDI to MusicXML: {e}")
 
+def resolve_model_path(checkpoint_dir):
+    """
+    Returns the best available model path in order of preference:
+    1. best_model directory
+    2. lowest validation loss epoch_N directory
+    3. latest epoch_N directory (with warning)
+    """
+    best_path = os.path.join(checkpoint_dir, "best_model")
+    if os.path.exists(best_path):
+        return best_path
+
+    import re
+    import json as _json
+    epoch_dirs = []
+    for name in os.listdir(checkpoint_dir):
+        match = re.match(r"^epoch_(\d+)$", name)
+        if match:
+            epoch_dirs.append((int(match.group(1)), os.path.join(checkpoint_dir, name)))
+    if not epoch_dirs:
+        return best_path
+
+    # Prefer lowest validation loss if sidecar exists
+    best_val = float("inf")
+    best_val_dir = None
+    latest_num, latest_dir = max(epoch_dirs, key=lambda x: x[0])
+    for num, path in epoch_dirs:
+        val_loss_path = os.path.join(path, "val_loss.json")
+        if os.path.exists(val_loss_path):
+            try:
+                with open(val_loss_path, "r", encoding="utf-8") as f:
+                    val_data = _json.load(f)
+                val_loss = val_data.get("val_loss", float("inf"))
+                if val_loss < best_val:
+                    best_val = val_loss
+                    best_val_dir = path
+            except Exception:
+                pass
+    if best_val_dir:
+        print(f"Warning: best_model not found. Falling back to lowest-val-loss checkpoint: {best_val_dir}")
+        return best_val_dir
+
+    print(f"Warning: best_model not found. Falling back to latest checkpoint: {latest_dir}")
+    return latest_dir
+
+
 if __name__ == "__main__":
     import argparse
     from src.config import CHECKPOINT_DIR, GENERATE_CONFIG, OUTPUT_DIR, BASE_DIR
@@ -970,8 +1117,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.path.join(CHECKPOINT_DIR, "best_model"),
-        help="Path to the trained model directory."
+        default=None,
+        help="Path to the trained model directory. Defaults to best_model or latest epoch_N."
     )
     parser.add_argument(
         "--output_midi",
@@ -995,10 +1142,11 @@ if __name__ == "__main__":
     
     tokenizer = get_tokenizer()
     
-    if os.path.exists(args.model_path):
+    model_path = args.model_path if args.model_path else resolve_model_path(CHECKPOINT_DIR)
+    if os.path.exists(model_path):
         user_inputs = load_input_json(args.input_json)
         generate_music(
-            model_path=args.model_path,
+            model_path=model_path,
             tokenizer=tokenizer,
             generate_config=GENERATE_CONFIG,
             output_midi_path=args.output_midi,
@@ -1006,4 +1154,4 @@ if __name__ == "__main__":
             user_inputs=user_inputs
         )
     else:
-        print(f"Model path {args.model_path} does not exist. Please check the path or train the model first.")
+        print(f"Model path {model_path} does not exist. Please check the path or train the model first.")

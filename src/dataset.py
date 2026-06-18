@@ -2,99 +2,100 @@ import os
 import random
 import re
 import json
+import math
 from pathlib import Path
 import torch
-from torch.utils.data import Dataset, DataLoader
-from src.control_tokens import get_control_prefix
+from torch.utils.data import Dataset, DataLoader, Sampler
+from src.control_tokens import get_control_prefix, CONTROL_TOKENS
 
-class PackedMusicDataset(Dataset):
+
+class SinglePieceDataset(Dataset):
     """
-    Packs multiple short tokenized MIDI sequences into fixed-length 
-    training sequences to ensure all positions up to max_seq_len are trained.
+    One piece per sample. Long pieces are split into overlapping chunks.
+    Each chunk is: [BOS] + control_prefix + tokens + [EOS], padded to max_seq_len.
     """
-    def __init__(self, files_paths, tokenizer, max_seq_len, bos_token_id, eos_token_id, pad_token_id):
+    def __init__(self, files_paths, tokenizer, max_seq_len, bos_token_id, eos_token_id, pad_token_id,
+                 overlap=256, min_real_ratio=0.25):
         self.max_seq_len = max_seq_len
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.vocab_size = len(tokenizer)
-        
-        self.packed = []
-        buffer = []
-        
-        # Load and tokenize all MIDI files in memory
+        self.overlap = min(overlap, max_seq_len // 2) # Cap overlap to prevent infinite loops when max_seq_len is small (e.g. in dry-run)
+        self.min_real_ratio = min_real_ratio
+        self.samples = []
+        self.tokenizer = tokenizer
+
         for filepath in files_paths:
             try:
-                # 1. Load and tokenize the MIDI file
-                tokens_seq = tokenizer(Path(filepath))
-                if isinstance(tokens_seq, list):
-                    if len(tokens_seq) > 0:
-                        ids = tokens_seq[0].ids
-                    else:
-                        continue
-                else:
-                    ids = tokens_seq.ids
-                
-                # 2. Get control prefix tokens
-                basename = os.path.basename(filepath)
-                original_base = re.sub(r"_transposed_[-+]?\d+$", "", os.path.splitext(basename)[0])
-                control_json_path = os.path.join(os.path.dirname(filepath), f"{original_base}.control.json")
-                
-                control_prefix_ids = []
-                vocab_offset = len(tokenizer)
-                if os.path.exists(control_json_path):
-                    try:
-                        with open(control_json_path, "r", encoding="utf-8") as f:
-                            metadata = json.load(f)
-                        from src.control_tokens import CONTROL_TOKENS
-                        prefix_tokens = get_control_prefix(metadata)
-                        for t in prefix_tokens:
-                            if t in CONTROL_TOKENS:
-                                control_prefix_ids.append(vocab_offset + CONTROL_TOKENS.index(t))
-                    except Exception as e:
-                        print(f"  Warning: Failed to load control JSON for {filepath}: {e}")
-                
-                # Fallback if no controls
-                if not control_prefix_ids:
-                    print(f"  Note: No control prefix found for {filepath}. Using fallback defaults.")
-                    fallback_tokens = ["GENRE_KEYBOARD", "MOOD_ANDANTE", "DENSITY_MODERATE", "V2", "TEMPO_MEDIUM"]
-                    from src.control_tokens import CONTROL_TOKENS
-                    for t in fallback_tokens:
-                        if t in CONTROL_TOKENS:
-                            control_prefix_ids.append(vocab_offset + CONTROL_TOKENS.index(t))
-                
-                # Assemble sequence: [BOS] + control_prefix + ids + [EOS]
-                entry = []
-                if self.bos_token_id is not None:
-                    entry.append(self.bos_token_id)
-                entry.extend(control_prefix_ids)
-                entry.extend(ids)
-                if self.eos_token_id is not None:
-                    entry.append(self.eos_token_id)
-                
-                # Add to buffer
-                buffer.extend(entry)
-                
-                # Pack buffer
-                while len(buffer) >= self.max_seq_len:
-                    self.packed.append(buffer[:self.max_seq_len])
-                    buffer = buffer[self.max_seq_len:]
+                self._process_file(Path(filepath))
             except Exception as e:
                 print(f"  Error: Failed to process MIDI file {filepath}: {e}")
-                
-        # Don't waste short tails
-        if len(buffer) > 0:
-            padded_buffer = buffer + [self.pad_token_id] * (self.max_seq_len - len(buffer))
-            self.packed.append(padded_buffer)
-            
+
+    def _process_file(self, filepath):
+        # 1. Tokenize
+        tokens_seq = self.tokenizer(filepath)
+        if isinstance(tokens_seq, list):
+            if len(tokens_seq) > 0:
+                ids = tokens_seq[0].ids
+            else:
+                return
+        else:
+            ids = tokens_seq.ids
+
+        # 2. Load control prefix
+        basename = os.path.basename(filepath)
+        original_base = re.sub(r"_transposed_[-+]?\d+$", "", os.path.splitext(basename)[0])
+        control_json_path = os.path.join(os.path.dirname(filepath), f"{original_base}.control.json")
+
+        control_prefix_ids = []
+        vocab_offset = len(self.tokenizer)
+        if os.path.exists(control_json_path):
+            try:
+                with open(control_json_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                prefix_tokens = get_control_prefix(metadata)
+                for t in prefix_tokens:
+                    if t in CONTROL_TOKENS:
+                        control_prefix_ids.append(vocab_offset + CONTROL_TOKENS.index(t))
+            except Exception as e:
+                print(f"  Warning: Failed to load control JSON for {filepath}: {e}")
+
+        if not control_prefix_ids:
+            fallback_tokens = ["GENRE_KEYBOARD", "MOOD_ANDANTE", "DENSITY_MODERATE", "V2", "TEMPO_MEDIUM", "MODE_MAJOR"]
+            for t in fallback_tokens:
+                if t in CONTROL_TOKENS:
+                    control_prefix_ids.append(vocab_offset + CONTROL_TOKENS.index(t))
+
+        # 3. Assemble full sequence: BOS + control + ids + EOS
+        prefix = []
+        if self.bos_token_id is not None:
+            prefix.append(self.bos_token_id)
+        prefix.extend(control_prefix_ids)
+        if self.eos_token_id is not None:
+            full_ids = prefix + list(ids) + [self.eos_token_id]
+        else:
+            full_ids = prefix + list(ids)
+
+        # 4. Chunk with overlap
+        chunk_start = 0
+        while chunk_start < len(full_ids):
+            chunk_end = min(chunk_start + self.max_seq_len, len(full_ids))
+            chunk = full_ids[chunk_start:chunk_end]
+            # Count real (non-pad) tokens in the chunk
+            real_count = sum(1 for t in chunk if t != self.pad_token_id)
+            if real_count >= self.max_seq_len * self.min_real_ratio or chunk_start == 0:
+                self.samples.append(chunk)
+            chunk_start = chunk_end - self.overlap if chunk_end < len(full_ids) else chunk_end
+
     def __len__(self):
-        return len(self.packed)
-        
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        ids = self.packed[idx]
+        ids = self.samples[idx]
         labels = [
-            -100 if (t == self.pad_token_id or t == self.bos_token_id or t >= self.vocab_size)
-            else t for t in ids
+            -100 if (t == self.pad_token_id or t == self.bos_token_id or t >= self.vocab_size) else t
+            for t in ids
         ]
         return {
             "input_ids": torch.tensor(ids, dtype=torch.long),
@@ -102,14 +103,96 @@ class PackedMusicDataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.long)
         }
 
-def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val_split=0.1):
+
+class DynamicDataCollator:
     """
-    Splits files list into train and validation sets, tokenizes and packs them in memory,
-    and returns PyTorch DataLoader objects.
+    Pads a batch to the maximum length in the batch. Labels are -100 on PAD.
+    Returns the number of non-pad target tokens for loss normalization.
+    """
+    def __init__(self, pad_token_id):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features):
+        max_len = max(len(f["input_ids"]) for f in features)
+        batch_input_ids = []
+        batch_attention_mask = []
+        batch_labels = []
+        loss_scale = 0
+        for f in features:
+            ids = f["input_ids"].tolist()
+            attn = f["attention_mask"].tolist()
+            labels = f["labels"].tolist()
+            pad_len = max_len - len(ids)
+            if pad_len > 0:
+                ids = ids + [self.pad_token_id] * pad_len
+                attn = attn + [0] * pad_len
+                labels = labels + [-100] * pad_len
+            batch_input_ids.append(ids)
+            batch_attention_mask.append(attn)
+            batch_labels.append(labels)
+            loss_scale += sum(1 for lab in labels if lab != -100)
+        return {
+            "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long),
+            "labels": torch.tensor(batch_labels, dtype=torch.long),
+            "loss_scale": torch.tensor(loss_scale, dtype=torch.long)
+        }
+
+
+class LengthGroupedSampler(Sampler):
+    """
+    Sorts samples by length, creates batches of similar lengths, and distributes across ranks.
+    """
+    def __init__(self, dataset, batch_size, rank=0, world_size=1, shuffle=False, seed=42):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        # Precompute lengths
+        lengths = [len(s) for s in dataset.samples]
+        self.indices = list(range(len(lengths)))
+        self.indices.sort(key=lambda i: lengths[i])
+
+    def __iter__(self):
+        indices = list(self.indices)
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            # Shuffle within length-ordered blocks for stability
+            block_size = max(self.batch_size * 4, 1)
+            blocks = [indices[i:i + block_size] for i in range(0, len(indices), block_size)]
+            random.Random(self.seed + self.epoch).shuffle(blocks)
+            indices = [i for b in blocks for i in b]
+
+        total_batches = math.ceil(len(indices) / self.batch_size)
+        # Distribute batches across ranks: each rank gets every world_size-th batch
+        for batch_idx in range(total_batches):
+            if batch_idx % self.world_size != self.rank:
+                continue
+            start = batch_idx * self.batch_size
+            end = min(start + self.batch_size, len(indices))
+            yield indices[start:end]
+
+    def __len__(self):
+        total_batches = math.ceil(len(self.indices) / self.batch_size)
+        return (total_batches + self.world_size - 1 - self.rank) // self.world_size
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
+def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val_split=0.1,
+                            rank=0, world_size=1):
+    """
+    Splits files list into train and validation sets, tokenizes them as single-piece samples,
+    and returns PyTorch DataLoader objects with dynamic padding and length grouping.
     """
     # Filter files_paths to only include MIDI files (excluding control JSON files)
     midi_files = [Path(f) for f in files_paths if os.path.splitext(str(f))[1].lower() in ['.mid', '.midi']]
-    
+
     # Group files by their original base name to prevent data leakage
     grouped_files = {}
     for f in midi_files:
@@ -117,35 +200,35 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
         if original_base not in grouped_files:
             grouped_files[original_base] = []
         grouped_files[original_base].append(f)
-        
+
     # Shuffle and split original pieces
     unique_pieces = list(grouped_files.keys())
     random.seed(42)
     sorted_pieces = sorted(unique_pieces)
     random.shuffle(sorted_pieces)
-    
+
     val_size = int(len(sorted_pieces) * val_split)
     if val_size == 0 and len(sorted_pieces) > 1 and val_split > 0:
         val_size = 1
-        
+
     val_pieces = sorted_pieces[:val_size]
     train_pieces = sorted_pieces[val_size:]
-    
+
     val_paths = []
     for p in val_pieces:
         val_paths.extend(grouped_files[p])
-        
+
     train_paths = []
     for p in train_pieces:
         train_paths.extend(grouped_files[p])
-    
+
     print(f"Dataset split: {len(train_paths)} training files, {len(val_paths)} validation files.")
-    
+
     pad_token_id = tokenizer["PAD_None"] if "PAD_None" in tokenizer else tokenizer.pad_token_id
     bos_token_id = tokenizer["BOS_None"] if "BOS_None" in tokenizer else None
     eos_token_id = tokenizer["EOS_None"] if "EOS_None" in tokenizer else None
-    
-    train_dataset = PackedMusicDataset(
+
+    train_dataset = SinglePieceDataset(
         files_paths=train_paths,
         tokenizer=tokenizer,
         max_seq_len=max_seq_len,
@@ -153,8 +236,8 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id
     )
-    
-    val_dataset = PackedMusicDataset(
+
+    val_dataset = SinglePieceDataset(
         files_paths=val_paths,
         tokenizer=tokenizer,
         max_seq_len=max_seq_len,
@@ -162,20 +245,29 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id
     ) if len(val_paths) > 0 else None
-    
-    print(f"Packed dataset: {len(train_dataset)} training chunks, {len(val_dataset) if val_dataset else 0} validation chunks.")
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False
-    ) if val_dataset else None
-    
-    return train_loader, val_loader
 
+    print(f"Single-piece dataset: {len(train_dataset)} training chunks, {len(val_dataset) if val_dataset else 0} validation chunks.")
+
+    collator = DynamicDataCollator(pad_token_id=pad_token_id)
+
+    train_sampler = LengthGroupedSampler(
+        train_dataset, batch_size=batch_size, rank=rank, world_size=world_size, shuffle=True
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        collate_fn=collator
+    )
+
+    val_loader = None
+    if val_dataset:
+        val_sampler = LengthGroupedSampler(
+            val_dataset, batch_size=batch_size, rank=rank, world_size=world_size, shuffle=False
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=val_sampler,
+            collate_fn=collator
+        )
+
+    return train_loader, val_loader

@@ -13,6 +13,7 @@ CONTROL_TOKENS = [
     "TAG_MINUETTO", "TAG_PRELUDE", "TAG_FUGUE", "TAG_TOCCATA",
     "TAG_GAVOTTE", "TAG_ARIA", "TAG_PASSACAGLIA", "TAG_SARABANDE",
     "TAG_BOURREE", "TAG_GIGUE", "TAG_SICILIANA",
+    "MODE_MAJOR", "MODE_MINOR",
 ]
 
 def extract_bwv_number(filename):
@@ -139,19 +140,8 @@ def analyze_piece(score, filepath):
     avg_tempo = sum(tempos) / len(tempos) if len(tempos) > 0 else 120.0
     
     # Estimate major/minor mode
-    # Standard heuristic: key_signatures in symusic
-    mode_is_minor = False
-    if len(score.key_signatures) > 0:
-        # Check if mode is minor
-        ks = score.key_signatures[0]
-        # In symusic, key signature mode is represented as tonality (0 = major, 1 = minor)
-        mode_is_minor = bool(getattr(ks, "tonality", 0))
-    else:
-        # Fallback: minor if 'm' or 'min' in filename or key representation
-        basename = os.path.basename(filepath).lower()
-        if "minor" in basename or " min" in basename or "_m_" in basename:
-            mode_is_minor = True
-            
+    mode_is_minor, mode_source = detect_mode(score, filepath)
+    
     # Calculate note density: total notes / total duration
     total_notes = sum(len(t.notes) for t in score.tracks)
     # Notes per beat (quarter note)
@@ -180,6 +170,8 @@ def analyze_piece(score, filepath):
     else:
         tempo_cat = "MEDIUM"
         
+    mode = "MAJOR" if not mode_is_minor else "MINOR"
+    
     tag = classify_baroque_tag(filepath)
     
     return {
@@ -189,8 +181,30 @@ def analyze_piece(score, filepath):
         "voices": voices_token,
         "tempo": tempo_cat,
         "tag": tag,
+        "mode": mode,
         "avg_tempo": avg_tempo
     }
+
+
+def detect_mode(score, filepath):
+    """
+    Detects the mode of a piece using a priority chain:
+    1. symusic key_signatures[0].tonality if present
+    2. filename heuristic ("minor", " min", "_m_")
+    3. default MAJOR
+    """
+    mode_is_minor = False
+    mode_source = "default"
+    if len(score.key_signatures) > 0:
+        ks = score.key_signatures[0]
+        mode_is_minor = bool(getattr(ks, "tonality", 0))
+        mode_source = "midi"
+    else:
+        basename = os.path.basename(filepath).lower()
+        if "minor" in basename or " min" in basename or "_m_" in basename:
+            mode_is_minor = True
+            mode_source = "filename"
+    return mode_is_minor, mode_source
 
 def get_control_prefix(metadata):
     """Translates metadata dictionary to a list of control token strings."""
@@ -199,7 +213,8 @@ def get_control_prefix(metadata):
         f"MOOD_{metadata['mood']}",
         f"DENSITY_{metadata['density']}",
         metadata['voices'],
-        f"TEMPO_{metadata['tempo']}"
+        f"TEMPO_{metadata['tempo']}",
+        f"MODE_{metadata['mode']}"
     ]
     if metadata.get("tag"):
         prefix.append(f"TAG_{metadata['tag']}")
