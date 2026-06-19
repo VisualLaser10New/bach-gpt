@@ -147,11 +147,13 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         except Exception as e:
             if rank == 0:
                 print(f"Warning: Failed to restore training state: {e}. Starting fresh.")
-    elif start_epoch > 1 and rank == 0:
-        print(f"Warning: Resuming from epoch {start_epoch} but {state_path} is missing. Optimizer momentum lost.")
+    elif start_epoch > 1:
+        if rank == 0:
+            print(f"Warning: Resuming from epoch {start_epoch} but {state_path} is missing. Optimizer momentum lost.")
         best_val_loss, best_epoch = _reconstruct_best_val_loss(checkpoint_dir)
-        print(f"  Reconstructed best validation loss {best_val_loss:.4f} from epoch sidecars (best_epoch={best_epoch}).")
-        print("  Re-running 5% warmup on resume to reduce loss spike...")
+        if rank == 0:
+            print(f"  Reconstructed best validation loss {best_val_loss:.4f} from epoch sidecars (best_epoch={best_epoch}).")
+            print("  Re-running 5% warmup on resume to reduce loss spike...")
         # Reset scheduler to a short warmup: 5% of remaining steps
         remaining_steps = (num_epochs - start_epoch + 1) * steps_per_epoch
         warmup_steps = max(1, int(remaining_steps * 0.05))
@@ -309,22 +311,23 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         else:
             epochs_no_improve += 1
 
-        if rank == 0:
-            unwrapped_model = model.module if ddp_enabled else model
-            # Validate weights are finite before saving
-            has_bad_weights = False
-            for name, param in unwrapped_model.named_parameters():
-                if not torch.isfinite(param).all():
+        # Validate weights are finite before saving (run on all ranks to prevent DDP deadlocks)
+        has_bad_weights = False
+        unwrapped_model = model.module if ddp_enabled else model
+        for name, param in unwrapped_model.named_parameters():
+            if not torch.isfinite(param).all():
+                if rank == 0:
                     print(f"  [ERROR] Parameter '{name}' contains nan/inf. Aborting checkpoint save.")
-                    has_bad_weights = True
-                    break
-            if has_bad_weights:
-                raise RuntimeError(
-                    f"Cannot save checkpoint: model weights contain nan/inf. "
-                    f"This indicates training diverged at epoch {epoch}. "
-                    f"Consider reducing learning rate or gradient clip norm."
-                )
+                has_bad_weights = True
+                break
+        if has_bad_weights:
+            raise RuntimeError(
+                f"Cannot save checkpoint: model weights contain nan/inf. "
+                f"This indicates training diverged at epoch {epoch}. "
+                f"Consider reducing learning rate or gradient clip norm."
+            )
 
+        if rank == 0:
             if is_best:
                 best_model_path = os.path.join(checkpoint_dir, "best_model")
                 os.makedirs(best_model_path, exist_ok=True)

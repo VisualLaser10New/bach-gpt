@@ -84,20 +84,28 @@ def main():
     checkpoint_dir = CHECKPOINT_DIR
     
     if args.reset:
-        print("Reset flag active. Cleaning up existing checkpoints and tokenizer...")
-        import shutil
-        # Clean checkpoint directory
-        if os.path.exists(checkpoint_dir):
-            shutil.rmtree(checkpoint_dir)
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Clean tokenizer
-        tokenizer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer.json")
-        if os.path.exists(tokenizer_path):
-            try:
-                os.remove(tokenizer_path)
-                print("Deleted existing tokenizer.json")
-            except OSError as e:
-                print(f"Warning: Could not delete tokenizer.json: {e}")
+        if rank == 0:
+            print("Reset flag active. Cleaning up existing checkpoints and tokenizer...")
+            import shutil
+            # Clean checkpoint directory
+            if os.path.exists(checkpoint_dir):
+                try:
+                    shutil.rmtree(checkpoint_dir)
+                    print(f"Deleted checkpoint directory: {checkpoint_dir}")
+                except Exception as e:
+                    print(f"Warning: Could not delete checkpoint directory: {e}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            # Clean tokenizer
+            tokenizer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer.json")
+            if os.path.exists(tokenizer_path):
+                try:
+                    os.remove(tokenizer_path)
+                    print("Deleted existing tokenizer.json")
+                except OSError as e:
+                    print(f"Warning: Could not delete tokenizer.json: {e}")
+        # Synchronize ranks to ensure rank 0 finishes reset before others proceed
+        if is_ddp and world_size > 1:
+            dist.barrier()
                 
     print("==========================================================")
     print("   J.S. Bach Polyphonic Sheet Music AI Training Pipeline  ")
