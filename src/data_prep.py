@@ -149,7 +149,9 @@ def prepare_dataset(raw_dir, processed_dir, semitones_list=None):
     tasks = [(f, processed_dir, semitones_list) for f in midi_files]
     
     try:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
             # Consume the iterator to trigger processing and show progress
             list(tqdm(
                 executor.map(_transpose_worker, tasks),

@@ -10,6 +10,8 @@ if __name__ == "__main__":
     parser.add_argument("--hf-repo", type=str, default=os.environ.get("HF_REPO", None))
     parser.add_argument("--hf-token", type=str, default=os.environ.get("HF_TOKEN", None))
     args = parser.parse_args()
+    if args.hf_token is not None and args.hf_token.strip() == "":
+        args.hf_token = None
 
     # If launched without torchrun, fall back to single-process mode.
     if "LOCAL_RANK" not in os.environ:

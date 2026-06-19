@@ -54,6 +54,8 @@ def main():
         help="Hugging Face access token with WRITE permissions."
     )
     args = parser.parse_args()
+    if args.hf_token is not None and args.hf_token.strip() == "":
+        args.hf_token = None
     
     if args.hf_repo:
         args.hf_repo = sanitize_hf_repo(args.hf_repo)
@@ -62,6 +64,16 @@ def main():
     is_ddp = "LOCAL_RANK" in os.environ
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    # Initialize process group early so ranks can synchronize during HuggingFace download.
+    # train_model()'s _setup_distributed() will detect dist is already initialized and skip re-init.
+    if is_ddp and world_size > 1:
+        if not dist.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
     
@@ -112,31 +124,35 @@ def main():
         
     # Hugging Face Checkpoint Syncing (Download phase)
     if args.hf_repo and not args.reset and not args.dry_run:
-        print(f"Hugging Face sync active. Checking repository '{args.hf_repo}' for existing checkpoints...")
-        try:
-            from huggingface_hub import snapshot_download, HfApi
-            api = HfApi(token=args.hf_token)
-            if api.repo_exists(repo_id=args.hf_repo, repo_type="model"):
-                print(f"  Downloading existing checkpoints from Hugging Face Hub...")
-                os.makedirs(checkpoint_dir, exist_ok=True)
-                snapshot_download(
-                    repo_id=args.hf_repo,
-                    local_dir=checkpoint_dir,
-                    token=args.hf_token,
-                    ignore_patterns=["*.git*", "README.md", ".gitattributes"]
-                )
-                print(f"  Checkpoints downloaded successfully.")
-                
-                # Copy tokenizer.json if present
-                local_tokenizer_in_checkpoints = os.path.join(checkpoint_dir, "tokenizer.json")
-                if os.path.exists(local_tokenizer_in_checkpoints):
-                    import shutil
-                    shutil.copy(local_tokenizer_in_checkpoints, TOKENIZER_PATH)
-                    print(f"  Copied tokenizer.json from checkpoints to workspace root.")
-            else:
-                print(f"  Repository '{args.hf_repo}' does not exist yet. Will create it on the first save.")
-        except Exception as e:
-            print(f"  Warning: Could not sync from Hugging Face Hub: {e}")
+        if rank == 0:
+            print(f"Hugging Face sync active. Checking repository '{args.hf_repo}' for existing checkpoints...")
+            try:
+                from huggingface_hub import snapshot_download, HfApi
+                api = HfApi(token=args.hf_token)
+                if api.repo_exists(repo_id=args.hf_repo, repo_type="model"):
+                    print(f"  Downloading existing checkpoints from Hugging Face Hub...")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    snapshot_download(
+                        repo_id=args.hf_repo,
+                        local_dir=checkpoint_dir,
+                        token=args.hf_token,
+                        ignore_patterns=["*.git*", "README.md", ".gitattributes"]
+                    )
+                    print(f"  Checkpoints downloaded successfully.")
+
+                    # Copy tokenizer.json if present
+                    local_tokenizer_in_checkpoints = os.path.join(checkpoint_dir, "tokenizer.json")
+                    if os.path.exists(local_tokenizer_in_checkpoints):
+                        import shutil
+                        shutil.copy(local_tokenizer_in_checkpoints, TOKENIZER_PATH)
+                        print(f"  Copied tokenizer.json from checkpoints to workspace root.")
+                else:
+                    print(f"  Repository '{args.hf_repo}' does not exist yet. Will create it on the first save.")
+            except Exception as e:
+                print(f"  Warning: Could not sync from Hugging Face Hub: {e}")
+        # Synchronize: wait for rank 0 to finish downloading before any rank scans checkpoint_dir
+        if is_ddp and world_size > 1:
+            dist.barrier()
 
     # Detect checkpoint epoch early to know if we are starting a fresh run
     start_epoch = 1
@@ -178,7 +194,10 @@ def main():
     # Phase 1: Data Preparation & Augmentation
     print("--- Phase 1: Preparing and Augmenting Dataset ---")
     semitones_list = train_config.get("transposition_keys", [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5])
-    prepare_dataset(DATASET_DIR, PROCESSED_DIR, semitones_list=semitones_list)
+    if rank == 0:
+        prepare_dataset(DATASET_DIR, PROCESSED_DIR, semitones_list=semitones_list)
+    if is_ddp and world_size > 1:
+        dist.barrier()
     processed_files = get_midi_files(PROCESSED_DIR)
     
     if len(processed_files) == 0:
@@ -200,27 +219,47 @@ def main():
         
     # Force rebuild the tokenizer if we are starting a fresh run (epoch 1) to ensure the mapping matches
     force_rebuild = (start_epoch == 1) or args.dry_run
-    if force_rebuild:
-        print("Starting a fresh run. Rebuilding tokenizer from scratch on mapped files...")
-    tokenizer = get_tokenizer(tokenizer_files, force_rebuild=force_rebuild)
     
-    # Copy tokenizer.json to /kaggle/working/ for easy download if running on Kaggle
-    if os.path.exists("/kaggle/working") and os.path.isdir("/kaggle/working"):
-        try:
-            import shutil
-            shutil.copy(TOKENIZER_PATH, os.path.join("/kaggle/working", "tokenizer.json"))
-            print("Copied tokenizer.json to /kaggle/working/ for easy download.")
-        except Exception as e:
-            print(f"Warning: Could not copy tokenizer.json to /kaggle/working/: {e}")
+    if rank == 0:
+        if force_rebuild:
+            print("Starting a fresh run. Rebuilding tokenizer from scratch on mapped files...")
+            # Clean up any dataset cache files to prevent loading stale caches
+            if os.path.exists(PROCESSED_DIR):
+                for name in os.listdir(PROCESSED_DIR):
+                    if name.startswith("dataset_cache_") and name.endswith(".pkl"):
+                        cache_file_path = os.path.join(PROCESSED_DIR, name)
+                        try:
+                            os.remove(cache_file_path)
+                            print(f"Deleted stale dataset cache: {cache_file_path}")
+                        except OSError as e:
+                            print(f"Warning: Could not delete dataset cache {cache_file_path}: {e}")
+        tokenizer = get_tokenizer(tokenizer_files, force_rebuild=force_rebuild)
+    
+    if is_ddp and world_size > 1:
+        dist.barrier()
+        
+    if rank != 0:
+        tokenizer = get_tokenizer(tokenizer_files, force_rebuild=False)
+        
+    if rank == 0:
+        # Copy tokenizer.json to /kaggle/working/ for easy download if running on Kaggle
+        if os.path.exists("/kaggle/working") and os.path.isdir("/kaggle/working"):
+            try:
+                import shutil
+                shutil.copy(TOKENIZER_PATH, os.path.join("/kaggle/working", "tokenizer.json"))
+                print("Copied tokenizer.json to /kaggle/working/ for easy download.")
+            except Exception as e:
+                print(f"Warning: Could not copy tokenizer.json to /kaggle/working/: {e}")
     
     # Phase 3: DataLoader Preparation
     print("\n--- Phase 3: Preparing PyTorch DataLoaders ---")
+    val_split = train_config.get("val_split", 0.1) if not args.dry_run else 0.0
     train_loader, val_loader = prepare_dataset_loaders(
         files_paths=processed_files,
         tokenizer=tokenizer,
         max_seq_len=model_config["n_positions"],
         batch_size=train_config["batch_size"],
-        val_split=0.2 if not args.dry_run else 0.0, # No val split for tiny dry-run
+        val_split=val_split,
         rank=rank,
         world_size=world_size
     )
@@ -245,20 +284,36 @@ def main():
             except Exception:
                 pass
         model = BachLlamaForCausalLM.from_pretrained(latest_epoch_path)
+        # Validate loaded weights are finite
+        import torch
+        for name, param in model.named_parameters():
+            if not torch.isfinite(param).all():
+                raise RuntimeError(
+                    f"Loaded checkpoint '{latest_epoch_path}' contains nan/inf in parameter '{name}'. "
+                    f"The checkpoint is corrupted. Run with --reset to start fresh."
+                )
     else:
         print("No existing checkpoints found. Initializing new model weights...")
-        model = get_model(tokenizer, model_config)
+        model = get_model(tokenizer, model_config, seed=train_config.get("seed", 42))
 
-    # Enable gradient checkpointing to drastically reduce activation memory for 4096 context length
-    if not args.dry_run:
-        model.gradient_checkpointing_enable()
-        print("Gradient checkpointing enabled to prevent CUDA Out-Of-Memory errors.")
+    # Disable cache for training (required when gradient checkpointing is used).
+    model.config.use_cache = False
+    # Gradient checkpointing is disabled by default: the 75M model fits in 15GB T4 without it,
+    # and the custom dropout wrappers in BachLlamaForCausalLM are incompatible with the
+    # reentrant variant. If OOM occurs, uncomment the block below to enable the safe
+    # non-reentrant variant (use_reentrant=False) which correctly handles RNG state.
+    # if not args.dry_run:
+    #     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    #     print("Gradient checkpointing (use_reentrant=False) enabled to prevent CUDA OOM.")
     # Save the initialized model configuration/weights so inference script can load it
     best_model_path = os.path.join(checkpoint_dir, "best_model")
     if start_epoch == 1:
-        os.makedirs(best_model_path, exist_ok=True)
-        model.save_pretrained(best_model_path)
-        print(f"Saved baseline model configuration to {best_model_path}")
+        if rank == 0:
+            os.makedirs(best_model_path, exist_ok=True)
+            model.save_pretrained(best_model_path)
+            print(f"Saved baseline model configuration to {best_model_path}")
+        if is_ddp and world_size > 1:
+            dist.barrier()
     
     # Phase 5: Model Training
     if args.no_train:
@@ -277,24 +332,25 @@ def main():
         )
     
     # Phase 6: Output Generation
-    print("\n--- Phase 6: Generating Sample Sheet Music ---")
-    out_mid = os.path.join(OUTPUT_DIR, "dry_run_bach.mid" if args.dry_run else "generated_bach.mid")
-    out_xml = os.path.join(OUTPUT_DIR, "dry_run_bach.xml" if args.dry_run else "generated_bach.xml")
-    
-    if os.path.exists(best_model_path):
-        generate_music(
-            model_path=best_model_path,
-            tokenizer=tokenizer,
-            generate_config=generate_config,
-            output_midi_path=out_mid,
-            output_xml_path=out_xml
-        )
-    else:
-        print("Skipping generation: no model found at best_model.")
-    
-    print("\n==========================================================")
-    print("             Pipeline Executed Successfully!             ")
-    print("==========================================================")
+    if rank == 0:
+        print("\n--- Phase 6: Generating Sample Sheet Music ---")
+        out_mid = os.path.join(OUTPUT_DIR, "dry_run_bach.mid" if args.dry_run else "generated_bach.mid")
+        out_xml = os.path.join(OUTPUT_DIR, "dry_run_bach.xml" if args.dry_run else "generated_bach.xml")
+        
+        if os.path.exists(best_model_path):
+            generate_music(
+                model_path=best_model_path,
+                tokenizer=tokenizer,
+                generate_config=generate_config,
+                output_midi_path=out_mid,
+                output_xml_path=out_xml
+            )
+        else:
+            print("Skipping generation: no model found at best_model.")
+        
+        print("\n==========================================================")
+        print("             Pipeline Executed Successfully!             ")
+        print("==========================================================")
 
 if __name__ == "__main__":
     main()

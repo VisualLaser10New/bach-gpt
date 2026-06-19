@@ -807,7 +807,7 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
     and applies custom instrument layouts, tempo, pitch, and post-processing ornaments.
     """
     print(f"Loading trained model from {model_path}...")
-    model = LlamaForCausalLM.from_pretrained(model_path)
+    model = LlamaForCausalLM.from_pretrained(model_path, attn_implementation="sdpa")
     model.eval()
     
     # Sanity check for load-bearing coupling with virtual control tokens

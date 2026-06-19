@@ -45,6 +45,7 @@ training:
   logging_steps: 50                 # Log every N steps
   seed: 42
   transposition_keys: [-2, 0, 2, -3, 5]  # 5 keys spanning the circle of fifths
+  val_split: 0.1
 
 # Inference Configuration
 generate:

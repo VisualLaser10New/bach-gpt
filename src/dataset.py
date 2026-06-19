@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, Sampler
 from src.control_tokens import get_control_prefix, CONTROL_TOKENS
 
@@ -15,7 +16,7 @@ class SinglePieceDataset(Dataset):
     Each chunk is: [BOS] + control_prefix + tokens + [EOS], padded to max_seq_len.
     """
     def __init__(self, files_paths, tokenizer, max_seq_len, bos_token_id, eos_token_id, pad_token_id,
-                 overlap=256, min_real_ratio=0.25):
+                 overlap=256, min_real_ratio=0.25, rank=0, world_size=1):
         self.max_seq_len = max_seq_len
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
@@ -26,11 +27,80 @@ class SinglePieceDataset(Dataset):
         self.samples = []
         self.tokenizer = tokenizer
 
-        for filepath in files_paths:
+        import hashlib
+        import pickle
+
+        cache_file = None
+        if len(files_paths) > 0:
+            cache_dir = os.path.dirname(files_paths[0])
+            if os.path.exists(cache_dir):
+                hasher = hashlib.md5()
+                # Include tokenizer vocab size and all dataset parameters
+                hasher.update(
+                    f"{max_seq_len}_{self.vocab_size}_{bos_token_id}_{eos_token_id}_{pad_token_id}_{self.overlap}_{self.min_real_ratio}".encode()
+                )
+                # Include full file paths and modification times for cache invalidation
+                for p in sorted(files_paths, key=str):
+                    hasher.update(str(p).encode())
+                    try:
+                        hasher.update(str(os.path.getmtime(p)).encode())
+                    except OSError:
+                        pass
+                cache_file = os.path.join(cache_dir, f"dataset_cache_{hasher.hexdigest()}.pkl")
+
+        loaded = False
+        if cache_file and os.path.exists(cache_file):
             try:
-                self._process_file(Path(filepath))
+                with open(cache_file, "rb") as f:
+                    self.samples = pickle.load(f)
+                loaded = True
+                if rank == 0:
+                    print(f"Loaded dataset cache from {cache_file} ({len(self.samples)} samples)")
             except Exception as e:
-                print(f"  Error: Failed to process MIDI file {filepath}: {e}")
+                if rank == 0:
+                    print(f"Warning: Failed to load dataset cache {cache_file}: {e}")
+
+        if not loaded:
+            if rank == 0:
+                print(f"No valid cache found. Tokenizing {len(files_paths)} files...")
+                for filepath in files_paths:
+                    try:
+                        self._process_file(Path(filepath))
+                    except Exception as e:
+                        print(f"  Error: Failed to process MIDI file {filepath}: {e}")
+                
+                if cache_file:
+                    try:
+                        with open(cache_file, "wb") as f:
+                            pickle.dump(self.samples, f)
+                        print(f"Saved dataset cache to {cache_file}")
+                    except Exception as e:
+                        print(f"Warning: Failed to save dataset cache {cache_file}: {e}")
+            
+            # Synchronize all ranks: rank 0 must finish saving before other ranks load.
+            if dist.is_initialized() and world_size > 1:
+                dist.barrier()
+            
+            # All ranks (including rank 0) load the freshly saved cache to ensure identical samples.
+            if cache_file and os.path.exists(cache_file):
+                try:
+                    with open(cache_file, "rb") as f:
+                        self.samples = pickle.load(f)
+                    loaded = True
+                    if rank != 0:
+                        print(f"Rank {rank} loaded dataset cache ({len(self.samples)} samples)")
+                except Exception as e:
+                    print(f"Rank {rank} warning: Failed to load dataset cache after sync: {e}")
+        
+        if not loaded:
+            # Fallback: tokenize locally if cache could not be created or loaded.
+            if rank == 0:
+                print(f"Tokenizing {len(files_paths)} files as fallback...")
+            for filepath in files_paths:
+                try:
+                    self._process_file(Path(filepath))
+                except Exception as e:
+                    print(f"Rank {rank} error: Failed to process MIDI file {filepath}: {e}")
 
     def _process_file(self, filepath):
         # 1. Tokenize
@@ -84,7 +154,8 @@ class SinglePieceDataset(Dataset):
             chunk = full_ids[chunk_start:chunk_end]
             # Count real (non-pad) tokens in the chunk
             real_count = sum(1 for t in chunk if t != self.pad_token_id)
-            if real_count >= self.max_seq_len * self.min_real_ratio or chunk_start == 0:
+            min_real_tokens = max(1, int(self.max_seq_len * self.min_real_ratio))
+            if real_count >= min_real_tokens or (chunk_start == 0 and real_count > 0):
                 self.samples.append(chunk)
             chunk_start = chunk_end - self.overlap if chunk_end < len(full_ids) else chunk_end
 
@@ -168,17 +239,28 @@ class LengthGroupedSampler(Sampler):
             indices = [i for b in blocks for i in b]
 
         total_batches = math.ceil(len(indices) / self.batch_size)
-        # Distribute batches across ranks: each rank gets every world_size-th batch
+        per_rank = (total_batches + self.world_size - 1) // self.world_size
+
+        yielded = 0
         for batch_idx in range(total_batches):
             if batch_idx % self.world_size != self.rank:
                 continue
             start = batch_idx * self.batch_size
             end = min(start + self.batch_size, len(indices))
             yield indices[start:end]
+            yielded += 1
+
+        # Pad with repeated last batch if this rank has fewer batches than the max
+        last_start = (total_batches - 1) * self.batch_size if total_batches > 0 else 0
+        last_batch = indices[last_start:last_start + self.batch_size]
+        while yielded < per_rank:
+            yield last_batch
+            yielded += 1
 
     def __len__(self):
         total_batches = math.ceil(len(self.indices) / self.batch_size)
-        return (total_batches + self.world_size - 1 - self.rank) // self.world_size
+        per_rank = (total_batches + self.world_size - 1) // self.world_size
+        return per_rank
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -234,7 +316,9 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
         max_seq_len=max_seq_len,
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id
+        pad_token_id=pad_token_id,
+        rank=rank,
+        world_size=world_size
     )
 
     val_dataset = SinglePieceDataset(
@@ -243,7 +327,9 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
         max_seq_len=max_seq_len,
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id
+        pad_token_id=pad_token_id,
+        rank=rank,
+        world_size=world_size
     ) if len(val_paths) > 0 else None
 
     print(f"Single-piece dataset: {len(train_dataset)} training chunks, {len(val_dataset) if val_dataset else 0} validation chunks.")

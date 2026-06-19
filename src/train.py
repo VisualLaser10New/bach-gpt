@@ -17,7 +17,12 @@ def _setup_distributed():
     rank = int(os.environ.get("RANK", 0))
     if local_rank >= 0 and world_size > 1:
         if not dist.is_initialized():
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
             dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        else:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
         return True, rank, world_size, local_rank
     return False, 0, 1, 0 if torch.cuda.is_available() else -1
 
@@ -104,6 +109,7 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
     optimizer = AdamW(
         _add_weight_decay(model, weight_decay),
         lr=train_config["learning_rate"],
+        betas=(0.9, 0.95),
     )
 
     # Learning rate scheduler details
@@ -152,10 +158,7 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, remaining_steps)
 
     # Broadcast best_val_loss to all ranks if DDP is enabled
-    if ddp_enabled:
-        best_val_loss_tensor = torch.tensor(best_val_loss, device=device)
-        dist.all_reduce(best_val_loss_tensor, op=dist.ReduceOp.MIN)
-        best_val_loss = best_val_loss_tensor.item()
+    # (Removed MIN reduction since training and validation losses are now globally aggregated)
 
     if rank == 0:
         print(f"Train batches: {batches_per_epoch}, Val batches: {len(val_loader) if val_loader else 0}")
@@ -163,7 +166,12 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
 
     # Wrap model in DDP after optimizer creation
     if ddp_enabled:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True
+        )
 
     for epoch in range(start_epoch, num_epochs + 1):
         # Tell samplers which epoch this is
@@ -175,9 +183,8 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
         # --- TRAINING PHASE ---
         model.train()
         total_train_loss = 0.0
-        total_train_tokens = 0
+        total_train_tokens = 0.0
         train_steps = 0
-        accum_tokens = 0
 
         optimizer.zero_grad()
 
@@ -194,41 +201,62 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
 
             # Forward pass with mixed precision
             with autocast(device_type=device.type, enabled=(device.type == "cuda")):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                # outputs.loss is averaged over the micro-batch's non-pad tokens.
-                # Multiply by loss_scale to get the unnormalized sum for this micro-batch,
-                # then we will normalize by the total tokens in the accumulation window.
-                loss = outputs.loss * loss_scale
+                if loss_scale.item() == 0:
+                    if rank == 0:
+                        print(f"  [Warning] Batch at step {step} has 0 valid labels. Using dummy zero loss to maintain sync.")
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=None
+                    )
+                    loss = (outputs.logits * 0.0).sum()
+                else:
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss / accum_steps
 
             # Backward with optional no_sync for DDP gradient accumulation
             sync_context = model.no_sync() if (ddp_enabled and not should_sync) else contextlib.nullcontext()
             with sync_context:
                 scaler.scale(loss).backward()
 
-            accum_tokens += loss_scale.item()
-            total_train_loss += outputs.loss.item() * loss_scale.item()
-            total_train_tokens += loss_scale.item()
+            if loss_scale.item() > 0:
+                total_train_loss += outputs.loss.item() * loss_scale.item()
+                total_train_tokens += loss_scale.item()
             train_steps += 1
 
             # Optimization step
             if should_sync:
-                # Normalize accumulated gradients by total tokens in this window
                 scaler.unscale_(optimizer)
-                inv_tokens = 1.0 / accum_tokens if accum_tokens > 0 else 1.0
-                for param in model.parameters():
-                    if param.grad is not None:
-                        param.grad.mul_(inv_tokens)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = scaler.get_scale()
+                
                 optimizer.zero_grad()
-                scheduler.step()
-                accum_tokens = 0
+                
+                if scale_after >= scale_before:
+                    scheduler.step()
+                else:
+                    if rank == 0:
+                        print(f"  [Overflow] Skipped optimizer step (scale: {scale_before:.0f} -> {scale_after:.0f})")
 
-            train_bar.set_postfix({"Loss": f"{total_train_loss / max(total_train_tokens, 1):.4f}"})
+            if rank == 0:
+                train_bar.set_postfix({
+                    "Loss": f"{total_train_loss / max(total_train_tokens, 1):.4f}",
+                    "Scale": f"{scaler.get_scale():.0f}"
+                })
+
+        if ddp_enabled:
+            metrics = torch.tensor([total_train_loss, total_train_tokens], device=device, dtype=torch.float64)
+            dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+            total_train_loss = metrics[0].item()
+            total_train_tokens = metrics[1].item()
 
         avg_train_loss = total_train_loss / max(total_train_tokens, 1)
 
@@ -247,6 +275,8 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
                     labels = batch["labels"].to(device)
                     loss_scale = batch["loss_scale"].to(device).float()
 
+                    if loss_scale.item() == 0:
+                        continue
                     with autocast(device_type=device.type, enabled=(device.type == "cuda")):
                         outputs = model(
                             input_ids=input_ids,
@@ -256,6 +286,12 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
                     total_val_loss += outputs.loss.item() * loss_scale.item()
                     total_val_tokens += loss_scale.item()
                     val_steps += 1
+
+            if ddp_enabled:
+                metrics = torch.tensor([total_val_loss, total_val_tokens], device=device, dtype=torch.float64)
+                dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+                total_val_loss = metrics[0].item()
+                total_val_tokens = metrics[1].item()
 
             avg_val_loss = total_val_loss / max(total_val_tokens, 1)
             if rank == 0:
@@ -274,17 +310,30 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
             epochs_no_improve += 1
 
         if rank == 0:
+            unwrapped_model = model.module if ddp_enabled else model
+            # Validate weights are finite before saving
+            has_bad_weights = False
+            for name, param in unwrapped_model.named_parameters():
+                if not torch.isfinite(param).all():
+                    print(f"  [ERROR] Parameter '{name}' contains nan/inf. Aborting checkpoint save.")
+                    has_bad_weights = True
+                    break
+            if has_bad_weights:
+                raise RuntimeError(
+                    f"Cannot save checkpoint: model weights contain nan/inf. "
+                    f"This indicates training diverged at epoch {epoch}. "
+                    f"Consider reducing learning rate or gradient clip norm."
+                )
+
             if is_best:
                 best_model_path = os.path.join(checkpoint_dir, "best_model")
                 os.makedirs(best_model_path, exist_ok=True)
-                unwrapped_model = model.module if ddp_enabled else model
                 unwrapped_model.save_pretrained(best_model_path)
                 print(f"--> Saved new best model to {best_model_path} (Loss: {best_val_loss:.4f})")
 
             # Save regular epoch checkpoint
             epoch_path = os.path.join(checkpoint_dir, f"epoch_{epoch}")
             os.makedirs(epoch_path, exist_ok=True)
-            unwrapped_model = model.module if ddp_enabled else model
             unwrapped_model.save_pretrained(epoch_path)
 
             # Save validation loss sidecar
@@ -302,6 +351,22 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
                 "epochs_no_improve": epochs_no_improve,
             }, state_path)
             print(f"Saved training state to {state_path}")
+
+            # Clean up older epoch checkpoints to manage disk space
+            # Keep only the current epoch checkpoint and the best_model
+            import re
+            for name in os.listdir(checkpoint_dir):
+                match = re.match(r"^epoch_(\d+)$", name)
+                if match:
+                    old_epoch = int(match.group(1))
+                    if old_epoch < epoch:
+                        old_epoch_path = os.path.join(checkpoint_dir, name)
+                        try:
+                            import shutil
+                            shutil.rmtree(old_epoch_path)
+                            print(f"Deleted old epoch checkpoint to save space: {old_epoch_path}")
+                        except Exception as e:
+                            print(f"Warning: Could not delete old checkpoint {old_epoch_path}: {e}")
 
         # --- HUGGING FACE SYNC ---
         if hf_repo and rank == 0 and not os.environ.get("DRY_RUN"):
@@ -344,6 +409,13 @@ def train_model(model, train_loader, val_loader, train_config, checkpoint_dir, s
                 print(f"--> Successfully synchronized Epoch {epoch} checkpoints with Hugging Face Hub.")
             except Exception as e:
                 print(f"  Warning: Hugging Face sync failed: {e}")
+
+        # Synchronize all ranks before next epoch / early stopping decision.
+        # Rank 0 may spend significant time saving checkpoints and uploading to HuggingFace;
+        # without this barrier, ranks 1+ would enter the next epoch's training loop and
+        # hit DDP all-reduce, causing an NCCL timeout while waiting for rank 0.
+        if ddp_enabled:
+            dist.barrier()
 
         # --- EARLY STOPPING ---
         if epochs_no_improve >= early_stopping_patience:

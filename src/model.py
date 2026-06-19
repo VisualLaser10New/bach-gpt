@@ -32,7 +32,7 @@ class BachLlamaForCausalLM(LlamaForCausalLM):
             layer.forward = layer_forward
 
 
-def get_model(tokenizer, config_dict):
+def get_model(tokenizer, config_dict, seed=42):
     """
     Instantiates an untrained Bach LLaMA language model with parameters specified in config_dict
     and sized dynamically to match the tokenizer's vocabulary + custom control tokens.
@@ -58,6 +58,15 @@ def get_model(tokenizer, config_dict):
         mlp_bias=False,
         attention_dropout=0.1,
     )
+
+    # Explicitly request SDPA for memory-efficient attention on T4
+    config._attn_implementation = "sdpa"
+
+    import torch
+    # Set seed for reproducible weight initialization
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # Initialize model from config (new weights, ready to train)
     model = BachLlamaForCausalLM(config)
