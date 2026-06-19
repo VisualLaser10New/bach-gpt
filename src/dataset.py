@@ -63,7 +63,7 @@ class SinglePieceDataset(Dataset):
 
         if not loaded:
             if rank == 0:
-                print(f"No valid cache found. Tokenizing {len(files_paths)} files...")
+                print(f"No valid cache found. Tokenizing unique {len(set(files_paths))} files (total {len(files_paths)} paths)...")
                 # Limit thread count to prevent context switching overhead
                 num_workers = min(16, (os.cpu_count() or 4) * 2)
                 
@@ -74,11 +74,13 @@ class SinglePieceDataset(Dataset):
                         print(f"  Error: Failed to process MIDI file {fp}: {e}")
                         return []
                 
+                unique_files = list(dict.fromkeys(files_paths))
                 with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                    results = list(executor.map(worker, files_paths))
+                    results = list(executor.map(worker, unique_files))
                 
-                for chunks in results:
-                    self.samples.extend(chunks)
+                path_to_chunks = {fp: chunks for fp, chunks in zip(unique_files, results)}
+                for fp in files_paths:
+                    self.samples.extend(path_to_chunks[fp])
                 
                 if cache_file:
                     try:
@@ -106,12 +108,16 @@ class SinglePieceDataset(Dataset):
         if not loaded:
             # Fallback: tokenize locally if cache could not be created or loaded.
             if rank == 0:
-                print(f"Tokenizing {len(files_paths)} files as fallback...")
+                print(f"Tokenizing unique files as fallback...")
+            path_to_chunks = {}
             for filepath in files_paths:
-                try:
-                    self.samples.extend(self._process_file(Path(filepath)))
-                except Exception as e:
-                    print(f"Rank {rank} error: Failed to process MIDI file {filepath}: {e}")
+                if filepath not in path_to_chunks:
+                    try:
+                        path_to_chunks[filepath] = self._process_file(Path(filepath))
+                    except Exception as e:
+                        print(f"Rank {rank} error: Failed to process MIDI file {filepath}: {e}")
+                        path_to_chunks[filepath] = []
+                self.samples.extend(path_to_chunks[filepath])
 
     def _process_file(self, filepath):
         # 1. Tokenize
@@ -313,11 +319,60 @@ def prepare_dataset_loaders(files_paths, tokenizer, max_seq_len, batch_size, val
     for p in val_pieces:
         val_paths.extend(grouped_files[p])
 
-    train_paths = []
-    for p in train_pieces:
-        train_paths.extend(grouped_files[p])
+    import symusic
 
-    print(f"Dataset split: {len(train_paths)} training files, {len(val_paths)} validation files.")
+    def get_oversample_factor(track_count):
+        if track_count <= 4:
+            return 1
+        elif track_count == 5:
+            return 3
+        elif track_count == 6:
+            return 4
+        elif track_count == 7:
+            return 5
+        elif track_count == 8:
+            return 6
+        elif track_count == 9:
+            return 8
+        elif track_count == 10:
+            return 10
+        elif track_count == 11:
+            return 12
+        elif track_count == 12:
+            return 3  # 12 tracks already has 68 files, modest boost
+        else:
+            return 10  # general boost for other large ensembles
+
+    train_paths = []
+    original_stats = {}
+    oversampled_stats = {}
+    for p in train_pieces:
+        files = grouped_files[p]
+        if not files:
+            continue
+        try:
+            score = symusic.Score(str(files[0]))
+            track_count = len(score.tracks)
+        except Exception as e:
+            track_count = 4
+            if rank == 0:
+                print(f"Warning: Could not read track count for {files[0]}: {e}")
+        
+        original_stats[track_count] = original_stats.get(track_count, 0) + len(files)
+        factor = get_oversample_factor(track_count)
+        oversampled_stats[track_count] = oversampled_stats.get(track_count, 0) + len(files) * factor
+        
+        for _ in range(factor):
+            train_paths.extend(files)
+
+    if rank == 0:
+        print("Training dataset track count distribution (Original -> Oversampled):")
+        for tc in sorted(set(original_stats.keys()) | set(oversampled_stats.keys())):
+            orig = original_stats.get(tc, 0)
+            oversamp = oversampled_stats.get(tc, 0)
+            print(f"  {tc} tracks: {orig} -> {oversamp} files")
+
+    print(f"Dataset split: {len(train_paths)} training files (oversampled), {len(val_paths)} validation files.")
 
     pad_token_id = tokenizer["PAD_None"] if "PAD_None" in tokenizer else tokenizer.pad_token_id
     bos_token_id = tokenizer["BOS_None"] if "BOS_None" in tokenizer else None

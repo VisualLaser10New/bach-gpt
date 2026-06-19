@@ -191,10 +191,12 @@ class VoiceBalanceProcessor(LogitsProcessor):
     """
     def __init__(self, tokenizer, max_silent_bars=2):
         self.program_tokens = {}
-        for i in range(16):  # General MIDI supports up to 16 channels
-            token_name = f"Program_{i}"
-            if token_name in tokenizer.vocab:
-                self.program_tokens[i] = tokenizer[token_name]
+        import re
+        for name, tid in tokenizer.vocab.items():
+            match = re.match(r"^Program_(\d+)$", name)
+            if match:
+                prog_idx = int(match.group(1))
+                self.program_tokens[prog_idx] = tid
         
         self.bar_token_id = tokenizer["Bar_None"] if "Bar_None" in tokenizer else None
         self.last_active_bar = {i: 0 for i in self.program_tokens}
@@ -975,12 +977,8 @@ def generate_music(model_path, tokenizer, generate_config, output_midi_path, out
             empty_track = symusic.Track(program=slot["program"], name=slot["track_name"])
             mapped_tracks.append(empty_track)
 
-    # Handle any leftover tracks beyond the requested slots
-    leftover_tracks = sorted_tracks[len(sorted_slots):]
-    for track in leftover_tracks:
-        track.program = 0
-        track.name = "Unassigned"
-        mapped_tracks.append(track)
+    # Discard any leftover tracks beyond the requested slots to match input.json exactly
+    pass
 
     decoded_midi.tracks = mapped_tracks
     

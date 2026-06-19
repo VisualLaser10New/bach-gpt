@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BachMusicInputConfig",
+  "description": "Configuration schema for input.json used to control music generation parameters.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Path to the JSON schema file."
+    },
+    "instruments": {
+      "type": "array",
+      "description": "List of instruments to be used in the generated music. Keyboard instruments (e.g. piano, organ, harpsichord) allocate 2 staves (left and right hands); other instruments allocate 1 stave.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "tempo": {
+      "type": "integer",
+      "description": "Tempo of the generated piece in Beats Per Minute (BPM). Values under 80 map to slow tempo; values over 125 map to fast tempo; other values map to medium tempo.",
+      "minimum": 20,
+      "maximum": 300
+    },
+    "key": {
+      "type": ["string", "null"],
+      "description": "The musical key of the piece (e.g., 'C Maj', 'D min', 'A min', 'Cm'). Keys ending in 'min' or 'm' (case-insensitive) will configure the generator to use minor mode, otherwise major mode is used."
+    },
+    "mood": {
+      "type": "string",
+      "description": "The expressive mood/tempo designation of the piece.",
+      "enum": ["vivace", "allegro", "andante", "adagio", "lento", "maestoso", "grazioso"]
+    },
+    "genre": {
+      "type": "string",
+      "description": "The musical genre of the composition.",
+      "enum": ["cantata", "chorale", "keyboard", "organ", "chamber", "concerto", "suite", "fugue"]
+    },
+    "density": {
+      "type": "string",
+      "description": "The note density density/thickness level.",
+      "enum": ["sparse", "moderate", "dense"]
+    },
+    "baroque_tag": {
+      "type": ["string", "null"],
+      "description": "Specific baroque form tag. Used to condition the model on a specific style.",
+      "enum": ["minuetto", "prelude", "fugue", "toccata", "gavotte", "aria", "passacaglia", "sarabande", "bourree", "gigue", "siciliana", null]
+    },
+    "form": {
+      "type": "string",
+      "description": "Overall structure of the piece. 'ABA' generates a three-section ternary form with variations in Section A'. 'single' generates a standard single-section piece.",
+      "enum": ["ABA", "single"]
+    },
+    "time_signature": {
+      "type": "string",
+      "description": "Time signature fraction string (e.g., '4/4', '3/4', '6/8'). Used to align bar boundaries.",
+      "pattern": "^[1-9][0-9]*/[1-9][0-9]*$"
+    }
+  },
+  "additionalProperties": false
+}
