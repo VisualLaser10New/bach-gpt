@@ -73,7 +73,11 @@ def main():
             import torch
             if torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)
-            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+            from datetime import timedelta
+            dist.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                timeout=timedelta(minutes=30)
+            )
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
     

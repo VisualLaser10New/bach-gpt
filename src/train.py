@@ -19,7 +19,11 @@ def _setup_distributed():
         if not dist.is_initialized():
             if torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)
-            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+            from datetime import timedelta
+            dist.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                timeout=timedelta(minutes=30)
+            )
         else:
             if torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)

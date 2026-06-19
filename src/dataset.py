@@ -4,6 +4,7 @@ import re
 import json
 import math
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -63,11 +64,21 @@ class SinglePieceDataset(Dataset):
         if not loaded:
             if rank == 0:
                 print(f"No valid cache found. Tokenizing {len(files_paths)} files...")
-                for filepath in files_paths:
+                # Limit thread count to prevent context switching overhead
+                num_workers = min(16, (os.cpu_count() or 4) * 2)
+                
+                def worker(fp):
                     try:
-                        self._process_file(Path(filepath))
+                        return self._process_file(Path(fp))
                     except Exception as e:
-                        print(f"  Error: Failed to process MIDI file {filepath}: {e}")
+                        print(f"  Error: Failed to process MIDI file {fp}: {e}")
+                        return []
+                
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    results = list(executor.map(worker, files_paths))
+                
+                for chunks in results:
+                    self.samples.extend(chunks)
                 
                 if cache_file:
                     try:
@@ -98,7 +109,7 @@ class SinglePieceDataset(Dataset):
                 print(f"Tokenizing {len(files_paths)} files as fallback...")
             for filepath in files_paths:
                 try:
-                    self._process_file(Path(filepath))
+                    self.samples.extend(self._process_file(Path(filepath)))
                 except Exception as e:
                     print(f"Rank {rank} error: Failed to process MIDI file {filepath}: {e}")
 
@@ -109,7 +120,7 @@ class SinglePieceDataset(Dataset):
             if len(tokens_seq) > 0:
                 ids = tokens_seq[0].ids
             else:
-                return
+                return []
         else:
             ids = tokens_seq.ids
 
@@ -149,6 +160,7 @@ class SinglePieceDataset(Dataset):
 
         # 4. Chunk with overlap
         chunk_start = 0
+        chunks = []
         while chunk_start < len(full_ids):
             chunk_end = min(chunk_start + self.max_seq_len, len(full_ids))
             chunk = full_ids[chunk_start:chunk_end]
@@ -156,8 +168,9 @@ class SinglePieceDataset(Dataset):
             real_count = sum(1 for t in chunk if t != self.pad_token_id)
             min_real_tokens = max(1, int(self.max_seq_len * self.min_real_ratio))
             if real_count >= min_real_tokens or (chunk_start == 0 and real_count > 0):
-                self.samples.append(chunk)
+                chunks.append(chunk)
             chunk_start = chunk_end - self.overlap if chunk_end < len(full_ids) else chunk_end
+        return chunks
 
     def __len__(self):
         return len(self.samples)
