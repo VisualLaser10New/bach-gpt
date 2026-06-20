@@ -1,6 +1,7 @@
 {
   "$schema": "./input.schema.json",
   "instruments": [
+    "oboe",
     "harpsichord"
   ],
   "tempo": 110,

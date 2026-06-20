@@ -40,7 +40,7 @@ training:
   learning_rate: 0.0003             # Learning rate for cosine scheduler
   num_epochs: 25                    # Number of epochs with early stopping
   early_stopping_patience: 5          # Stop if val loss doesn't improve for N epochs
-  weight_decay: 0.05                # Regularization
+  weight_decay: 0.10                # Regularization
   save_steps: 500                   # Save checkpoint every N steps
   logging_steps: 50                 # Log every N steps
   seed: 42
@@ -50,9 +50,9 @@ training:
 # Inference Configuration
 generate:
   max_length: 4096                  # Max tokens to generate
-  temperature: 0.75                 # Higher sampling temperature for more varied output
+  temperature: 0.87                 # Higher sampling temperature for more varied output
   top_p: 0.9                        # Nucleus sampling threshold
-  top_k: 7                         # Filter out low-probability tokens
+  top_k: 15                         # Filter out low-probability tokens
   repetition_penalty: 1.15          # Repetition penalty to break note loops
   no_repeat_ngram_size: 8           # Block exact 8-gram repeats
   time_signature: "4/4"             # Default time signature for generation / ABA merge

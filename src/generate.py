@@ -566,17 +566,10 @@ def get_bar_aligned_ticks(score, time_signature="4/4"):
 def apply_midi_variation(score):
     score_prime = copy.deepcopy(score)
     for track in score_prime.tracks:
-        # Group note indices by start time so chords shift together (Fix A)
-        time_groups = {}
         for n in track.notes:
-            time_groups.setdefault(n.time, []).append(n)
-        for time_val, group in time_groups.items():
-            shared_offset = random.randint(-12, 12)
-            for n in group:
-                n.velocity = max(20, min(127, int(n.velocity * random.uniform(0.9, 1.1))))
-                n.time = max(0, time_val + shared_offset)
-                if n.duration > 60:  # skip grace/ornament notes
-                    n.duration = max(24, int(n.duration * random.uniform(0.95, 1.05)))
+            n.velocity = max(20, min(127, int(n.velocity * random.uniform(0.9, 1.1))))
+            if n.duration > 60:  # skip grace/ornament notes
+                n.duration = max(24, int(n.duration * random.uniform(0.95, 1.05)))
     return score_prime
 
 def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
@@ -588,11 +581,11 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     # Split token budget per section
     section_tokens = generate_config.get("max_length", 4096) // 2
     bos_token_id = tokenizer["BOS_None"] if "BOS_None" in tokenizer else 0
+    vocab_offset = len(tokenizer)
     
     # === SECTION A ===
     print("Generating Section A (Main Theme)...")
     control_prefix = build_control_prefix_tokens(user_inputs)
-    vocab_offset = len(tokenizer)
     prompt_a_ids = []
     for t in control_prefix:
         if t in CONTROL_TOKENS:
@@ -602,80 +595,85 @@ def generate_aba_form(model, tokenizer, generate_config, user_inputs, device):
     
     # === SECTION B ===
     print("Generating Section B (Contrasting Section)...")
-    # Strip prompt, EOS, and PAD from Section A before slicing the bridge
-    eos_id = tokenizer["EOS_None"] if "EOS_None" in tokenizer else None
-    pad_id = tokenizer["PAD_None"] if "PAD_None" in tokenizer else tokenizer.pad_token_id
-    clean_section_a = [
-        t for t in section_a[len(prompt_a):] 
-        if t != eos_id and t != pad_id
-    ]
-    bridge_tokens = clean_section_a[-256:] if len(clean_section_a) >= 256 else clean_section_a
-    
     contrast_prefix = build_contrast_prefix_tokens(user_inputs)
     prompt_b_ids = []
     for t in contrast_prefix:
         if t in CONTROL_TOKENS:
             prompt_b_ids.append(vocab_offset + CONTROL_TOKENS.index(t))
-    prompt_b = [bos_token_id] + prompt_b_ids + bridge_tokens
-    section_b_full = generate_section(model, tokenizer, prompt_b, section_tokens, generate_config, user_inputs, device)
-    new_tokens_b = section_b_full[len(prompt_b):]
+    prompt_b = [bos_token_id] + prompt_b_ids
+    section_b = generate_section(model, tokenizer, prompt_b, section_tokens, generate_config, user_inputs, device)
     
-    # === DECODE A + B AND VARIATE A' ===
-    print("Decoding Section A + B...")
-    # Slice off prompt_a (BOS + control prefix) to avoid BPE KeyError on virtual tokens
+    # === DECODE SECTIONS ===
+    print("Decoding Section A...")
     notes_a = [t for t in section_a[len(prompt_a):] if t < len(tokenizer)]
-    new_tokens_b_clean = [t for t in new_tokens_b if t < len(tokenizer)]
-    tokens_ab = notes_a + new_tokens_b_clean
-    seq_ab = TokSequence(ids=tokens_ab)
-    seq_ab.are_ids_encoded = True
-    tokenizer.decode_token_ids(seq_ab)
-    score_ab = tokenizer(seq_ab)
-    score_ab = filter_degenerate_chords(score_ab)
-    
-    print("Decoding Section A for Reprise...")
     seq_a = TokSequence(ids=notes_a)
     seq_a.are_ids_encoded = True
     tokenizer.decode_token_ids(seq_a)
     score_a = tokenizer(seq_a)
     score_a = filter_degenerate_chords(score_a)
     
+    print("Decoding Section B...")
+    notes_b = [t for t in section_b[len(prompt_b):] if t < len(tokenizer)]
+    seq_b = TokSequence(ids=notes_b)
+    seq_b.are_ids_encoded = True
+    tokenizer.decode_token_ids(seq_b)
+    score_b = tokenizer(seq_b)
+    score_b = filter_degenerate_chords(score_b)
+    
     print("Applying MIDI variations to create Section A'...")
     score_a_prime = apply_midi_variation(score_a)
     
-    # Align and Merge
+    # === ALIGN AND MERGE SECTIONS (A -> B -> A') ===
     time_signature = user_inputs.get("time_signature", generate_config.get("time_signature", "4/4"))
-    align_boundary = get_bar_aligned_ticks(score_ab, time_signature)
     
-    # Re-tempo the reprise section to match Section A's initial tempo at the boundary
-    if len(score_a.tempos) > 0:
-        tempo_val = score_a.tempos[0].qpm
-        score_ab.tempos.append(symusic.Tempo(align_boundary, tempo_val))
-        print(f"Set reprise Section A' tempo to {tempo_val:.2f} BPM at tick {align_boundary}.")
+    # 1. Merge Section B onto Section A
+    align_boundary_b = get_bar_aligned_ticks(score_a, time_signature)
+    print(f"Merging Section B at tick {align_boundary_b}...")
     
-    print(f"Merging Section A' into the final score at tick {align_boundary}...")
-    # Group score_ab tracks by program number to align instruments correctly and avoid mismatches
-    ab_tracks_by_program = {t.program: t for t in score_ab.tracks}
-    
-    for t_prime in score_a_prime.tracks:
-        # Shift the track events directly to avoid duplicate global events
-        t_prime = t_prime.shift_time(align_boundary)
+    if len(score_b.tempos) > 0:
+        tempo_val_b = score_b.tempos[0].qpm
+        score_a.tempos.append(symusic.Tempo(align_boundary_b, tempo_val_b))
+        print(f"Set Section B tempo to {tempo_val_b:.2f} BPM at tick {align_boundary_b}.")
         
-        prog = t_prime.program
-        if prog in ab_tracks_by_program:
-            t_ab = ab_tracks_by_program[prog]
-            t_ab.notes.extend(t_prime.notes)
-            t_ab.controls.extend(t_prime.controls)
-            t_ab.pitch_bends.extend(t_prime.pitch_bends)
-            t_ab.pedals.extend(t_prime.pedals)
+    a_tracks_by_program = {t.program: t for t in score_a.tracks}
+    for t_b in score_b.tracks:
+        t_b = t_b.shift_time(align_boundary_b)
+        prog = t_b.program
+        if prog in a_tracks_by_program:
+            t_a = a_tracks_by_program[prog]
+            t_a.notes.extend(t_b.notes)
+            t_a.controls.extend(t_b.controls)
+            t_a.pitch_bends.extend(t_b.pitch_bends)
+            t_a.pedals.extend(t_b.pedals)
         else:
-            # If the track doesn't exist in score_ab (e.g. generation dropped it), append it
-            score_ab.tracks.append(t_prime)
+            score_a.tracks.append(t_b)
             
-    # Sort all events to ensure MIDI/XML output is chronologically ordered
-    if hasattr(score_ab, "sort"):
-        score_ab.sort()
+    # 2. Merge Section A' onto the combined score (score_a now contains A + B)
+    align_boundary_a_prime = get_bar_aligned_ticks(score_a, time_signature)
+    print(f"Merging Section A' at tick {align_boundary_a_prime}...")
+    
+    if len(score_a_prime.tempos) > 0:
+        tempo_val_a_prime = score_a_prime.tempos[0].qpm
+        score_a.tempos.append(symusic.Tempo(align_boundary_a_prime, tempo_val_a_prime))
+        print(f"Set reprise Section A' tempo to {tempo_val_a_prime:.2f} BPM at tick {align_boundary_a_prime}.")
+        
+    a_tracks_by_program = {t.program: t for t in score_a.tracks}
+    for t_prime in score_a_prime.tracks:
+        t_prime = t_prime.shift_time(align_boundary_a_prime)
+        prog = t_prime.program
+        if prog in a_tracks_by_program:
+            t_a = a_tracks_by_program[prog]
+            t_a.notes.extend(t_prime.notes)
+            t_a.controls.extend(t_prime.controls)
+            t_a.pitch_bends.extend(t_prime.pitch_bends)
+            t_a.pedals.extend(t_prime.pedals)
+        else:
+            score_a.tracks.append(t_prime)
             
-    return score_ab
+    if hasattr(score_a, "sort"):
+        score_a.sort()
+        
+    return score_a
 
 def is_trill_pattern(notes, i):
     if i + 3 >= len(notes):
