@@ -27,11 +27,11 @@ tokenizer:
 model:
   vocab_size: null                  # Will be set dynamically based on tokenizer
   n_positions: 4096                 # Context window (sequence length)
-  n_embd: 768                       # Hidden dimension
-  intermediate_size: 2048           # FFN intermediate (SwiGLU)
-  n_layer: 10                       # Transformer layers
-  n_head: 12                        # Attention heads
-  n_kv_head: 12                     # Key/value heads (no GQA)
+  n_embd: 384                       # Hidden dimension
+  intermediate_size: 1024           # FFN intermediate (SwiGLU)
+  n_layer: 6                       # Transformer layers
+  n_head: 6                        # Attention heads
+  n_kv_head: 6                     # Key/value heads (no GQA)
 
 # Training Configuration (Optimized for T4 VRAM)
 training:
@@ -50,7 +50,7 @@ training:
 # Inference Configuration
 generate:
   max_length: 4096                  # Max tokens to generate
-  temperature: 0.87                 # Higher sampling temperature for more varied output
+  temperature: 1                 # Higher sampling temperature for more varied output
   top_p: 0.9                        # Nucleus sampling threshold
   top_k: 15                         # Filter out low-probability tokens
   repetition_penalty: 1.15          # Repetition penalty to break note loops

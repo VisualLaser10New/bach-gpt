@@ -1,14 +1,15 @@
 {
   "$schema": "./input.schema.json",
   "instruments": [
+    "violin",
     "oboe",
     "harpsichord"
   ],
-  "tempo": 110,
+  "tempo": 120,
   "key": "D min",
   "mood": "allegro",
   "genre": "concerto",
-  "density": "dense",
+  "density": "moderate",
   "baroque_tag": null,
   "form": "ABA",
   "time_signature": "4/4"
