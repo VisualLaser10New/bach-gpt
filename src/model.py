@@ -6,11 +6,12 @@ from src.control_tokens import CONTROL_TOKENS
 class BachLlamaForCausalLM(LlamaForCausalLM):
     """
     LLaMA with extra dropout regularization for the Bach music domain.
-    Applies dropout after the embedding layer.
+    Applies dropout after the embedding layer and after each transformer layer's residual output.
     """
     def __init__(self, config):
         super().__init__(config)
         self.embed_dropout = nn.Dropout(0.1)
+        self.residual_dropout = nn.Dropout(0.05)  # Mild residual dropout to prevent early memorization
 
         # Wrap embedding forward to apply dropout on token embeddings
         orig_embed_forward = self.model.embed_tokens.forward
@@ -18,6 +19,17 @@ class BachLlamaForCausalLM(LlamaForCausalLM):
             emb = orig_forward(input_ids, *args, **kwargs)
             return self.embed_dropout(emb)
         self.model.embed_tokens.forward = embed_forward
+
+        # Wrap each decoder layer to apply residual dropout on the hidden state output
+        for layer in self.model.layers:
+            orig_layer_forward = layer.forward
+            def layer_forward(hidden_states, *args, orig_forward=orig_layer_forward, **kwargs):
+                out = orig_forward(hidden_states, *args, **kwargs)
+                if isinstance(out, tuple):
+                    hidden_states = self.residual_dropout(out[0])
+                    return (hidden_states,) + out[1:]
+                return self.residual_dropout(out)
+            layer.forward = layer_forward
 
 
 def get_model(tokenizer, config_dict, seed=42):

@@ -38,8 +38,8 @@ training:
   batch_size: 4                     # Actual GPU micro-batch
   gradient_accumulation_steps: 8    # Effective batch = 32
   learning_rate: 0.0003             # Learning rate for cosine scheduler
-  num_epochs: 25                    # Number of epochs with early stopping
-  early_stopping_patience: 5          # Stop if val loss doesn't improve for N epochs
+  num_epochs: 30                    # Number of epochs with early stopping
+  early_stopping_patience: 6          # Stop if val loss doesn't improve for N epochs
   weight_decay: 0.10                # Regularization
   save_steps: 500                   # Save checkpoint every N steps
   logging_steps: 50                 # Log every N steps
